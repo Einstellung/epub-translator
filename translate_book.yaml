@@ -1,0 +1,38 @@
+# translate_book.yaml — 一键翻译书籍的配置文件
+# 用法：  uv run python translate_book.py [config.yaml]
+# 不指定配置文件时默认读本文件（translate_book.yaml）。
+# 凡是注释掉的项都会用内置默认值；API 凭据仍从 .env 读取。
+
+# ── 必填 ──────────────────────────────────────────────
+source: "input/Chip War body.epub"      # 源 EPUB 路径
+# output: "output/我的书.zh-bilingual.epub"  # 不填则自动生成 output/<书名>.<语言>-bilingual.epub
+
+# ── 翻译设置 ──────────────────────────────────────────
+language: zh            # 目标语言：zh/en/ja/ko/fr/de/es
+submit: append-block    # 双语形式：append-block(原文后加译文,推荐) / append-text / replace
+concurrency: 16         # 并发请求数。实测 16 不限流、约 20x 加速
+max_group_tokens: 2600  # 单次翻译请求的最大 token 分组
+
+# ── 术语表（保证全书术语/人名一致）──────────────────────
+glossary:
+  enabled: true                 # 是否启用术语表
+  # path: "output/xxx.glossary.tsv"   # 指定现成术语表；留空则按下面规则
+  auto_generate: true           # path 不存在时，先自动从本书抽取生成术语表
+  min_freq: 2                   # 自动生成时，词频低于此值的候选丢弃（整本书建议 2）
+
+# ── 排除章节（spine id，不翻译这些文档）─────────────────
+# 尾注、索引等翻了对双语阅读价值不大，默认排除。
+exclude_spine_ids:
+  - endnotes
+  - index
+  - SS_US_adult_signup_front
+  - SS_US_adult_signup_back
+
+# ── 缓存 ──────────────────────────────────────────────
+# 每本书用独立缓存目录，支持断点续传（中断后重跑会跳过已译部分）。
+# 留空则自动用 .cache/<书名>
+cache_path: ""
+
+# ── 翻译风格（追加到系统提示的 <rules> 区）────────────────
+# 留空用内置的“技术非虚构、重流畅、拆长句”提示。
+user_prompt: ""

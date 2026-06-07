@@ -12,3 +12,13 @@ wheels/
 .cache/
 input/*.epub
 output/*.epub
+
+# Downloaded OCR models (~6 GB, re-downloaded on demand)
+models/
+
+# Generated artifacts and scratch test data
+output/*.tsv
+pdf_test/
+
+# Tooling
+.codegraph/
