@@ -11,6 +11,7 @@ wheels/
 .env
 .cache/
 input/*.epub
+input/*.pdf
 output/*.epub
 
 # Downloaded OCR models (~6 GB, re-downloaded on demand)

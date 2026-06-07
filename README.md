@@ -112,3 +112,23 @@ tiles. **`base`** is the default — best quality/VRAM trade-off for normal book
 (peak ~9 GB on a 12 GB card). Use `gundam` for dense, small-font or scanned
 pages; it recognises more but costs more VRAM and time.
 
+### Translating a math EPUB: fix MathML afterwards
+
+The translator skips formula *content* (math text is byte-identical before and
+after — it does not go to the LLM), but its re-serialiser rewrites each
+`<math xmlns="...MathML">` into a prefixed `<m:math>` form that many readers
+don't recognise, so matrices collapse onto a single line. Run `fix_epub_math.py`
+on the translated file to repair it:
+
+```bash
+uv run python pdf_to_epub.py input/book.pdf -o output/book.epub
+uv run python main.py output/book.epub -o output/book.zh.epub
+uv run python fix_epub_math.py output/book.zh.epub        # repair MathML in place
+```
+
+The repair is mechanical and lossless — it re-adds the `xmlns` namespace and
+strips the `m:` prefix, restoring the form readers render correctly. The
+`Unknown Tag appeared!! ... semantics` warnings printed during translation are
+the same root cause and are otherwise harmless.
+
+
