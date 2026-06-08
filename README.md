@@ -48,23 +48,28 @@ For translating a whole book, use the YAML-driven runner instead of long CLI fla
 It builds a book-level glossary, skips chapters you don't want (endnotes, index),
 shows a live progress bar, and is resumable.
 
+`translate_book.yaml` in the repo root is a **template** — don't edit it directly.
+Keep one config file per book under `configs/` and load the one you want:
+
 ```bash
-uv run python translate_book.py                 # reads translate_book.yaml
-uv run python translate_book.py my_book.yaml    # or a custom config
+cp translate_book.yaml configs/my-book.yaml      # one-time per book
+# edit configs/my-book.yaml to point at your EPUB
+uv run python translate_book.py configs/my-book.yaml
 ```
 
-Edit `translate_book.yaml` to point at your book:
+Running `translate_book.py` with no argument falls back to the root template.
+A book config points at the source EPUB and tunes glossary/exclusions/style:
 
 ```yaml
-source: "input/My Book.epub"
+source: "output/My Book.epub"
 concurrency: 16            # 16 is fast and not rate-limited in practice
 glossary:
   enabled: true
   auto_generate: true     # extract + resolve a glossary from the book on first run
   min_freq: 2
-exclude_spine_ids:        # documents to skip (their spine ids)
-  - endnotes
-  - index
+exclude_spine_ids: []     # spine ids to skip (e.g. endnotes, index); [] = none
+user_prompt: |            # appended to the system prompt — domain/style hints
+  这是一本机器人学技术书，术语统一、公式与代码原文保留。
 ```
 
 Every term/name in the glossary is rendered consistently across the whole book.

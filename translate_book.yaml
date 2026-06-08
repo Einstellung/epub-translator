@@ -1,10 +1,12 @@
-# translate_book.yaml — 一键翻译书籍的配置文件
-# 用法：  uv run python translate_book.py [config.yaml]
-# 不指定配置文件时默认读本文件（translate_book.yaml）。
+# translate_book.yaml — 翻译配置「模板」
+# 这是模板，不要直接改它。每本书复制一份到 configs/ 再改，例如：
+#   cp translate_book.yaml configs/my-book.yaml
+#   uv run python translate_book.py configs/my-book.yaml
+# 不指定配置文件时默认读本模板（translate_book.yaml）。
 # 凡是注释掉的项都会用内置默认值；API 凭据仍从 .env 读取。
 
 # ── 必填 ──────────────────────────────────────────────
-source: "input/Chip War body.epub"      # 源 EPUB 路径
+source: "input/Chip War body.epub"      # 源 EPUB 路径（示例值，复制后请替换）
 # output: "output/我的书.zh-bilingual.epub"  # 不填则自动生成 output/<书名>.<语言>-bilingual.epub
 
 # ── 翻译设置 ──────────────────────────────────────────

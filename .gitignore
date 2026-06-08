@@ -19,7 +19,14 @@ models/
 
 # Generated artifacts and scratch test data
 output/*.tsv
+output/.*.work/
 pdf_test/
+
+# Run logs
+logs/
+
+# Local editor/session state
+.claude/
 
 # Tooling
 .codegraph/
