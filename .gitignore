@@ -11,4 +11,22 @@ wheels/
 .env
 .cache/
 input/*.epub
+input/*.pdf
 output/*.epub
+
+# Downloaded OCR models (~6 GB, re-downloaded on demand)
+models/
+
+# Generated artifacts and scratch test data
+output/*.tsv
+output/.*.work/
+pdf_test/
+
+# Run logs
+logs/
+
+# Local editor/session state
+.claude/
+
+# Tooling
+.codegraph/

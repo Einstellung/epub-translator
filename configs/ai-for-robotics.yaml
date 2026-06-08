@@ -1,0 +1,35 @@
+# configs/ai-for-robotics.yaml — 《AI for Robotics》双语翻译配置
+# 用法：  uv run python translate_book.py configs/ai-for-robotics.yaml
+# 模板见仓库根目录的 translate_book.yaml；本文件按本书定制。
+# API 凭据从 .env 读取。
+
+# ── 必填 ──────────────────────────────────────────────
+source: "output/AI for Robotics.epub"   # 由 pdf_to_epub.py 从 PDF 转换得到
+# output 不填则自动生成 output/<书名>.<语言>-bilingual.epub
+
+# ── 翻译设置 ──────────────────────────────────────────
+language: zh            # 目标语言
+submit: append-block    # 双语形式：原文后追加译文（推荐）
+concurrency: 16         # 并发请求数，实测 16 不限流
+max_group_tokens: 2600  # 单次翻译请求的最大 token 分组
+
+# ── 术语表（保证全书术语/人名一致）──────────────────────
+glossary:
+  enabled: true
+  auto_generate: true   # 首次运行先从本书抽取术语表
+  min_freq: 2           # 整本书建议 2
+
+# ── 排除章节 ──────────────────────────────────────────
+# 本书 spine 很干净（标题页 + 7 章），尾注/索引已被 pandoc 并入正文，无需排除。
+exclude_spine_ids: []
+
+# ── 缓存 ──────────────────────────────────────────────
+# 留空自动用 .cache/<书名>，支持断点续传（中断后重跑跳过已译部分）。
+cache_path: ""
+
+# ── 翻译风格（追加到系统提示的 <rules> 区）────────────────
+user_prompt: |
+  这是一本关于机器人学与具身智能的技术书籍（AI for Robotics）。
+  - 专业术语首次出现时可用「中文（English）」形式，之后统一用中文。
+  - 保留行内代码、变量名、函数名、数学符号、公式原文不译。
+  - 译文要通顺自然，长句适当拆分，符合中文技术读者阅读习惯。

@@ -41,3 +41,99 @@ uv run python main.py input/book.epub -o output/custom.epub
 ```
 
 `append-block` is the default bilingual mode. It keeps the original text and adds translated blocks after it.
+
+## One-command translation (YAML + progress bar)
+
+For translating a whole book, use the YAML-driven runner instead of long CLI flags.
+It builds a book-level glossary, skips chapters you don't want (endnotes, index),
+shows a live progress bar, and is resumable.
+
+`translate_book.yaml` in the repo root is a **template** — don't edit it directly.
+Keep one config file per book under `configs/` and load the one you want:
+
+```bash
+cp translate_book.yaml configs/my-book.yaml      # one-time per book
+# edit configs/my-book.yaml to point at your EPUB
+uv run python translate_book.py configs/my-book.yaml
+```
+
+Running `translate_book.py` with no argument falls back to the root template.
+A book config points at the source EPUB and tunes glossary/exclusions/style:
+
+```yaml
+source: "output/My Book.epub"
+concurrency: 16            # 16 is fast and not rate-limited in practice
+glossary:
+  enabled: true
+  auto_generate: true     # extract + resolve a glossary from the book on first run
+  min_freq: 2
+exclude_spine_ids: []     # spine ids to skip (e.g. endnotes, index); [] = none
+user_prompt: |            # appended to the system prompt — domain/style hints
+  这是一本机器人学技术书，术语统一、公式与代码原文保留。
+```
+
+Every term/name in the glossary is rendered consistently across the whole book.
+The run caches per book under `.cache/<book>`, so an interrupted run resumes where
+it left off. Generate or inspect a glossary on its own with:
+
+```bash
+uv run python glossary.py "input/My Book.epub" --min-freq 2
+```
+
+## PDF to EPUB (math-aware)
+
+Have a PDF instead of an EPUB? Convert it first, then feed the EPUB into the
+translator above. This uses `pdf_craft` + DeepSeek-OCR for layout/text/formula
+recognition and `pandoc` for a clean, math-correct EPUB.
+
+```bash
+uv run python pdf_to_epub.py input/book.pdf                 # -> output/book.epub
+uv run python pdf_to_epub.py input/book.pdf -o output/my.epub --ocr-size base
+```
+
+Requirements: `pandoc` on PATH (`sudo apt install pandoc`) and an NVIDIA GPU.
+The DeepSeek-OCR model (~6.3 GB) downloads once into `models/` and is reused.
+
+What the pipeline does, and the gotchas it handles automatically:
+
+1. **OCR -> Markdown** via DeepSeek-OCR. Prose, matrices and inline math come
+   out well; **code blocks are the weak spot** — structure and identifiers get
+   mangled, so hand-check any code after conversion.
+2. **Fixes LaTeX over-escaping** — pdf_craft doubles every command backslash
+   inside math (`\\cos` -> `\cos`) while preserving real `\\` matrix row-breaks.
+3. **Resolves image paths** — pdf_craft's relative asset paths don't line up
+   with where files land, so pandoc can't embed them; we rewrite to absolute.
+4. **pandoc `--mathml`** — converts the now-valid LaTeX to MathML. pandoc's
+   matrix handling is correct where pdf_craft's own renderers flattened or
+   dropped matrices.
+5. **Strips `<annotation>` duplicates** — pandoc embeds a raw-LaTeX annotation
+   next to each formula; some readers print it as body text, doubling every
+   formula. We remove them.
+6. **Repackages** the EPUB with `mimetype` stored first, per spec.
+
+OCR resolution tiers (`--ocr-size`): `tiny`/`small`/`base`/`large` send the
+whole page as one image (512/640/1024/1280 px); `gundam` crops dense pages into
+tiles. **`base`** is the default — best quality/VRAM trade-off for normal books
+(peak ~9 GB on a 12 GB card). Use `gundam` for dense, small-font or scanned
+pages; it recognises more but costs more VRAM and time.
+
+### Translating a math EPUB: fix MathML afterwards
+
+The translator skips formula *content* (math text is byte-identical before and
+after — it does not go to the LLM), but its re-serialiser rewrites each
+`<math xmlns="...MathML">` into a prefixed `<m:math>` form that many readers
+don't recognise, so matrices collapse onto a single line. Run `fix_epub_math.py`
+on the translated file to repair it:
+
+```bash
+uv run python pdf_to_epub.py input/book.pdf -o output/book.epub
+uv run python main.py output/book.epub -o output/book.zh.epub
+uv run python fix_epub_math.py output/book.zh.epub        # repair MathML in place
+```
+
+The repair is mechanical and lossless — it re-adds the `xmlns` namespace and
+strips the `m:` prefix, restoring the form readers render correctly. The
+`Unknown Tag appeared!! ... semantics` warnings printed during translation are
+the same root cause and are otherwise harmless.
+
+
