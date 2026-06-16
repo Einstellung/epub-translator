@@ -1,0 +1,42 @@
+# configs/active-inference.yaml — 《Fundamentals of Active Inference》双语翻译配置
+# 用法：  uv run python translate_book.py configs/active-inference.yaml
+# 模板见仓库根目录的 translate_book.yaml。API 凭据从 .env 读取。
+#
+# 说明：本书是出版版 EPUB，公式以「图片」形式嵌入（无 MathML），
+# 因此翻译不会破坏公式，翻译后【无需】运行 fix_epub_math.py。
+
+# ── 必填 ──────────────────────────────────────────────
+source: "input/Fundamentals of Active Inference Principles, Algorithms, and Applications of the Free Energy Principle for Engineers.epub"
+# output 不填则自动生成 output/<书名>.<语言>-bilingual.epub
+
+# ── 翻译设置 ──────────────────────────────────────────
+language: zh
+submit: append-block    # 原文后追加译文
+concurrency: 16
+max_group_tokens: 2600
+
+# ── 术语表（保证全书术语一致）──────────────────────────
+glossary:
+  enabled: true
+  auto_generate: true
+  min_freq: 2
+
+# ── 排除章节 ──────────────────────────────────────────
+# 参考文献和索引翻译价值低（纯文献列表/术语页码），排除。
+# Glossary(术语定义)保留翻译。附录 B/C/D(数学基础)保留。
+exclude_spine_ids:
+  - id2216   # References
+  - id2217   # Index
+
+# ── 缓存（断点续传）────────────────────────────────────
+cache_path: ""
+
+# ── 翻译风格 ──────────────────────────────────────────
+user_prompt: |
+  这是一本关于主动推断（Active Inference）与自由能原理（Free Energy Principle）的工程技术书籍。
+  - 核心术语统一译法，首次出现可用「中文（English）」形式，之后用中文：
+    主动推断(Active Inference)、自由能原理(Free Energy Principle)、
+    变分自由能(Variational Free Energy)、期望自由能(Expected Free Energy)、
+    部分可观测马尔可夫决策过程(POMDP)、生成模型(generative model)、信念(belief)。
+  - 保留行内代码、变量名、数学符号、公式（多为图片）原文不译。
+  - 译文通顺自然，长句适当拆分，符合中文技术读者阅读习惯。
