@@ -15,6 +15,7 @@ import argparse
 import json
 import os
 import re
+import time
 import zipfile
 import xml.etree.ElementTree as ET
 from collections import Counter
@@ -244,8 +245,14 @@ def _completions_url(base: str) -> str:
     return f"{base}/v1/chat/completions"
 
 
-def llm_chat(system: str, user: str, *, max_tokens: int = 4096, timeout: float = 300.0) -> str:
-    """One non-streaming chat turn against the OpenAI- or Anthropic-style proxy."""
+def llm_chat(system: str, user: str, *, max_tokens: int = 4096, timeout: float = 300.0,
+             max_retries: int = 5) -> str:
+    """One non-streaming chat turn against the OpenAI- or Anthropic-style proxy.
+
+    Retries transient failures (gateway timeouts 502/503/504/524, rate limit 429,
+    and connection/read errors) with exponential backoff, so a single network
+    hiccup during a long glossary run doesn't kill the whole process.
+    """
     key = _env("EPUB_TRANSLATOR_API_KEY")
     base = _env("EPUB_TRANSLATOR_BASE_URL")
     model = _env("EPUB_TRANSLATOR_MODEL")
@@ -278,13 +285,31 @@ def llm_chat(system: str, user: str, *, max_tokens: int = 4096, timeout: float =
             ],
         }
 
-    resp = requests.post(url, headers=headers, json=payload, timeout=timeout)
-    if resp.status_code >= 400:
-        raise RuntimeError(f"LLM API error {resp.status_code}: {resp.text[:500]}")
-    data = resp.json()
-    if use_claude:
-        return "".join(p.get("text", "") for p in data.get("content", []) if p.get("type") == "text")
-    return data["choices"][0]["message"]["content"]
+    RETRYABLE = {429, 500, 502, 503, 504, 524}
+    last_err = None
+    for attempt in range(max_retries):
+        try:
+            resp = requests.post(url, headers=headers, json=payload, timeout=timeout)
+            if resp.status_code >= 400:
+                if resp.status_code in RETRYABLE and attempt < max_retries - 1:
+                    wait = min(2 ** attempt * 5, 60)
+                    print(f"  LLM API {resp.status_code}, retry {attempt + 1}/{max_retries} in {wait}s...")
+                    time.sleep(wait)
+                    continue
+                raise RuntimeError(f"LLM API error {resp.status_code}: {resp.text[:500]}")
+            data = resp.json()
+            if use_claude:
+                return "".join(p.get("text", "") for p in data.get("content", []) if p.get("type") == "text")
+            return data["choices"][0]["message"]["content"]
+        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
+            last_err = e
+            if attempt < max_retries - 1:
+                wait = min(2 ** attempt * 5, 60)
+                print(f"  network error ({type(e).__name__}), retry {attempt + 1}/{max_retries} in {wait}s...")
+                time.sleep(wait)
+                continue
+            raise
+    raise RuntimeError(f"LLM API failed after {max_retries} retries: {last_err}")
 
 
 RESOLVE_SYSTEM = (
@@ -332,16 +357,20 @@ def resolve_terms(terms: list[tuple[str, str]], batch_size: int = 20, timeout: f
             "Resolve these terms to Simplified Chinese. Return one JSON object per term, "
             "same order:\n" + json.dumps(payload, ensure_ascii=False, indent=1)
         )
-        raw = llm_chat(RESOLVE_SYSTEM, user, timeout=timeout)
-        for row in _parse_json_array(raw):
-            en = (row.get("en") or "").strip()
-            if en:
-                resolved[en] = {
-                    "zh": (row.get("zh") or "").strip(),
-                    "confidence": (row.get("confidence") or "").strip().lower(),
-                    "alt": (row.get("alt") or "").strip(),
-                    "note": (row.get("note") or "").strip(),
-                }
+        try:
+            raw = llm_chat(RESOLVE_SYSTEM, user, timeout=timeout)
+            for row in _parse_json_array(raw):
+                en = (row.get("en") or "").strip()
+                if en:
+                    resolved[en] = {
+                        "zh": (row.get("zh") or "").strip(),
+                        "confidence": (row.get("confidence") or "").strip().lower(),
+                        "alt": (row.get("alt") or "").strip(),
+                        "note": (row.get("note") or "").strip(),
+                    }
+        except Exception as e:
+            # One bad batch shouldn't discard the whole run; skip it and continue.
+            print(f"  WARNING: batch {start}-{start + len(batch)} failed ({e}); skipping")
         print(f"  resolved {min(start + batch_size, len(terms))}/{len(terms)}")
     return resolved
 
