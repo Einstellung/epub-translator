@@ -144,8 +144,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--concurrency",
         type=int,
-        default=int(os.getenv("EPUB_TRANSLATOR_CONCURRENCY", "1")),
-        help="Parallel translation requests. Keep low for rate-limited proxy APIs.",
+        default=int(os.getenv("EPUB_TRANSLATOR_CONCURRENCY", "16")),
+        help="Parallel translation requests. 16 is a good default; lower it only for rate-limited proxy APIs.",
     )
     parser.add_argument(
         "--max-group-tokens",
