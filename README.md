@@ -117,23 +117,34 @@ tiles. **`base`** is the default — best quality/VRAM trade-off for normal book
 (peak ~9 GB on a 12 GB card). Use `gundam` for dense, small-font or scanned
 pages; it recognises more but costs more VRAM and time.
 
-### Translating a math EPUB: fix MathML afterwards
+### Translating a math EPUB: math is masked automatically
 
-The translator skips formula *content* (math text is byte-identical before and
-after — it does not go to the LLM), but its re-serialiser rewrites each
-`<math xmlns="...MathML">` into a prefixed `<m:math>` form that many readers
-don't recognise, so matrices collapse onto a single line. Run `fix_epub_math.py`
-on the translated file to repair it:
+`epub_translator` does **not** pass MathML through cleanly. Internally
+(`translation/xml_interrupter.py`) it converts every `<math>` element to LaTeX
+via `mathml2latex` (which spams `Unknown Tag appeared!! ... semantics`, because
+it can't parse the MathML `<semantics>` wrapper) and hands the LaTeX to the LLM.
+The result: inline math comes back as a prefixed `<m:math>` form most readers
+won't render, and **display math / matrices leak into the output as literal
+`$$...$$` LaTeX text** (sometimes an empty `\begin{array}` — the structure is
+lost entirely).
+
+`translate_book.py` fixes this end-to-end with a **mask → translate → restore**
+wrapper (`mask_math.py`): before translation every `<math>` element is replaced
+with an inert `MATHPLACEHOLDERnnnnX` sentinel the translator/LLM pass through
+verbatim; afterwards the original, default-namespaced MathML is substituted
+back into every occurrence (append-block duplicates each block, so all copies
+are restored). Math never reaches the LLM, so it survives as renderable
+`<math xmlns="…MathML">` with subscripts/superscripts/matrices intact.
 
 ```bash
 uv run python pdf_to_epub.py input/book.pdf -o output/book.epub
-uv run python main.py output/book.epub -o output/book.zh.epub
-uv run python fix_epub_math.py output/book.zh.epub        # repair MathML in place
+uv run python translate_book.py configs/book.yaml     # masking is on by default
 ```
 
-The repair is mechanical and lossless — it re-adds the `xmlns` namespace and
-strips the `m:` prefix, restoring the form readers render correctly. The
-`Unknown Tag appeared!! ... semantics` warnings printed during translation are
-the same root cause and are otherwise harmless.
+This is automatic — no post-processing step needed. Set `mask_math: false` in
+the YAML config to opt out. `fix_epub_math.py` remains as a fallback repair for
+EPUBs produced by the older `main.py` path (it only re-namespaces surviving
+`<m:math>` and cannot recover display math that already leaked to LaTeX; the
+mask wrapper prevents the leak in the first place).
 
 

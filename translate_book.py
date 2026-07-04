@@ -23,6 +23,7 @@ from epub_translator import SubmitKind, language, translate
 from tqdm import tqdm
 
 import glossary as glossary_mod
+import mask_math as mask_math_mod
 from main import (
     DEFAULT_USER_PROMPT,
     LANGUAGES,
@@ -38,6 +39,7 @@ DEFAULTS = {
     "concurrency": 16,
     "max_group_tokens": 2600,
     "glossary": {"enabled": True, "path": "", "auto_generate": True, "min_freq": 2},
+    "mask_math": True,
     "exclude_spine_ids": [],
     "cache_path": "",
     "user_prompt": "",
@@ -161,6 +163,24 @@ def main() -> None:
         Path(cache_path).mkdir(parents=True, exist_ok=True)
         translate_source = trim_spine(source, cfg["exclude_spine_ids"], trimmed)
 
+    # 2b. MASK math: replace every <math> element with an inert sentinel token so
+    #     the translator never sees (and never mangles/flattens) the MathML. The
+    #     original formulas are restored verbatim after translation (see step 4).
+    #     Without this, epub_translator LaTeX-ifies math via mathml2latex: inline
+    #     math comes back as unrenderable <m:math> and display math/matrices leak
+    #     as literal `$$...$$` text. Set `mask_math: false` in the config to skip.
+    math_mapping: dict[int, str] = {}
+    translate_target = output
+    if cfg.get("mask_math", True):
+        Path(cache_path).mkdir(parents=True, exist_ok=True)
+        masked = Path(cache_path) / f"{source.stem}.masked.epub"
+        math_mapping, n_masked = mask_math_mod.mask_epub(translate_source, masked)
+        print(f"math: masked {n_masked} <math> element(s) before translation")
+        if n_masked:
+            translate_source = masked
+            # translate into a temp file, then restore math into `output`
+            translate_target = Path(cache_path) / f"{source.stem}.translated.epub"
+
     # 3. translate with a live progress bar
     import os
     os.environ["EPUB_TRANSLATOR_CACHE_PATH"] = cache_path
@@ -176,7 +196,7 @@ def main() -> None:
 
     translate(
         source_path=translate_source,
-        target_path=output,
+        target_path=translate_target,
         target_language=LANGUAGES[lang],
         submit=SUBMIT_KINDS[cfg["submit"]],
         user_prompt=user_prompt,
@@ -187,6 +207,13 @@ def main() -> None:
     )
     bar.update(max(0.0, 100 - last))
     bar.close()
+
+    # 4. RESTORE math: put the original MathML back in place of every sentinel
+    #    token (each appears >=1x; append-block duplicates it, so restore ALL).
+    if math_mapping:
+        restored = mask_math_mod.restore_epub(translate_target, output, math_mapping)
+        print(f"math: restored {restored} MathML occurrence(s) into {output}")
+
     print(f"\n✅ converted: {output}")
 
 

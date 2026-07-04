@@ -1,0 +1,15 @@
+source: "output/tiny_math_test.epub"
+output: "output/tiny_math_test.zh-bilingual.epub"
+language: zh
+submit: append-block
+concurrency: 4
+max_group_tokens: 2600
+glossary:
+  enabled: false
+  auto_generate: false
+mask_math: true
+exclude_spine_ids: []
+cache_path: ".cache/tiny_math_test"
+user_prompt: |
+  这是测试文本。保留所有占位符 token（如 MATHPLACEHOLDER0001X）原样不译、不改动。
+  译文通顺自然。
