@@ -89,7 +89,15 @@ recognition and `pandoc` for a clean, math-correct EPUB.
 ```bash
 uv run python pdf_to_epub.py input/book.pdf                 # -> output/book.epub
 uv run python pdf_to_epub.py input/book.pdf -o output/my.epub --ocr-size base
+uv run python pdf_to_epub.py input/paper.pdf --split-references   # 论文：拆出参考文献
 ```
+
+**论文场景加 `--split-references`**：把 References/Bibliography 段拆成独立的
+`references.xhtml`，登记进 OPF 的 manifest 和 spine（idref 为 `references`）。学术 PDF 转出的
+EPUB 是单文件（整篇一个 `ch001.xhtml`），拆开后书目才有独立 spine id，翻译器就能用
+`exclude_spine_ids` 把它排除在翻译外、又保留在成品里（`translate_book.yaml` 默认已排除
+`references`）。带体量自检：万一误判标题会保留原样、不动正文。标题识别 References /
+Bibliography / 参考文献（忽略大小写与前导编号）。旧的 `--strip-references` 作为别名保留。
 
 Requirements: `pandoc` on PATH (`sudo apt install pandoc`) and an NVIDIA GPU.
 The DeepSeek-OCR model (~6.3 GB) downloads once into `models/` and is reused.

@@ -27,6 +27,7 @@ glossary:
 exclude_spine_ids:
   - endnotes
   - index
+  - references             # 拆出的参考文献不翻译，双语成品里原样保留
   - SS_US_adult_signup_front
   - SS_US_adult_signup_back
 

@@ -86,6 +86,76 @@ def trim_spine(source: Path, exclude_ids: list[str], dest: Path) -> Path:
     return dest
 
 
+def _spine_itemrefs(opf: str) -> list[tuple[str, str]]:
+    """Return [(idref, itemref_xml), ...] in spine order."""
+    out = []
+    for m in re.finditer(r'<itemref\b[^>]*/>', opf):
+        frag = m.group(0)
+        id_m = re.search(r'\bidref="([^"]+)"', frag)
+        if id_m:
+            out.append((id_m.group(1), frag))
+    return out
+
+
+def restore_spine(target: Path, source: Path, exclude_ids: list[str]) -> list[str]:
+    """Re-insert `exclude_ids` into `target`'s OPF spine at their original spots.
+
+    `trim_spine` drops excluded documents from the spine only so `translate()`
+    skips them; excluding from translation must not hide them from the reader.
+    The excluded files already survive into `target` (they stay in the archive),
+    but without a spine itemref they are unreachable. Here we read the original
+    reading order from `source` and splice each excluded item back — verbatim, so
+    a `linear="no"` flag is preserved — after its original predecessor. The
+    result is a book whose spine matches the source, with excluded docs present
+    but untranslated.
+    """
+    exclude = set(exclude_ids)
+    with zipfile.ZipFile(source) as z:
+        src_opf_name = next(n for n in z.namelist() if n.endswith(".opf"))
+        original = _spine_itemrefs(z.read(src_opf_name).decode("utf-8"))
+    frags = {i: f for i, f in original if i in exclude}
+    if not frags:
+        return []
+
+    with zipfile.ZipFile(target) as z:
+        opf_name = next(n for n in z.namelist() if n.endswith(".opf"))
+        opf = z.read(opf_name).decode("utf-8")
+    present = {i for i, _ in _spine_itemrefs(opf)}
+
+    restored: list[str] = []
+    anchor: str | None = None  # idref the next item should be inserted after
+    for idref, _ in original:
+        if idref not in exclude:
+            anchor = idref
+            continue
+        if idref in present:  # already in target spine; don't duplicate
+            anchor = idref
+            continue
+        frag = frags[idref]
+        if anchor is None:
+            opf = re.sub(r'(<spine\b[^>]*>)', lambda m: m.group(1) + frag, opf, count=1)
+        else:
+            pat = re.compile(r'(<itemref\b[^>]*\bidref="' + re.escape(anchor) + r'"[^>]*/>)')
+            opf = pat.sub(lambda m: m.group(1) + frag, opf, count=1)
+        restored.append(idref)
+        anchor = idref
+
+    if not restored:
+        return []
+
+    tmp = target.with_suffix(target.suffix + ".tmp")
+    with zipfile.ZipFile(target) as zin, zipfile.ZipFile(tmp, "w", zipfile.ZIP_DEFLATED) as zout:
+        if "mimetype" in zin.namelist():
+            zout.writestr("mimetype", zin.read("mimetype"), compress_type=zipfile.ZIP_STORED)
+        for item in zin.infolist():
+            if item.filename == "mimetype":
+                continue
+            data = opf.encode("utf-8") if item.filename == opf_name else zin.read(item.filename)
+            zout.writestr(item, data)
+    tmp.replace(target)
+    return restored
+
+
 def ensure_glossary(cfg: dict, source: Path) -> Path | None:
     g = cfg["glossary"]
     if not g.get("enabled"):
@@ -213,6 +283,13 @@ def main() -> None:
     if math_mapping:
         restored = mask_math_mod.restore_epub(translate_target, output, math_mapping)
         print(f"math: restored {restored} MathML occurrence(s) into {output}")
+
+    # 5. RESTORE spine: excluded docs were dropped from the spine only to keep
+    #    them out of translation; put them back so they stay in the reading order
+    #    (present but untranslated), not orphaned in the archive.
+    if cfg["exclude_spine_ids"]:
+        restored_ids = restore_spine(output, source, cfg["exclude_spine_ids"])
+        print(f"spine: restored excluded docs into output: {restored_ids or 'none'}")
 
     print(f"\n✅ converted: {output}")
 

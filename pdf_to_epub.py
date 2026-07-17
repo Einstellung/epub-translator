@@ -34,8 +34,10 @@ import subprocess
 import sys
 import time
 import zipfile
+from copy import deepcopy
 from pathlib import Path
 
+from lxml import etree
 from pdf_craft import transform_markdown
 
 # DeepSeek-OCR resolution tiers (see doc_page_extractor/model.py):
@@ -121,6 +123,137 @@ def _strip_annotations(epub_dir: Path) -> int:
     return removed
 
 
+# Section titles that mark the bibliography. Matched case-insensitively after
+# stripping any leading numbering ("VIII. References" / "8 References").
+_REFERENCE_TITLES = {"references", "reference", "bibliography", "参考文献"}
+_XHTML_NS = "http://www.w3.org/1999/xhtml"
+
+
+def _tail_from_heading(ref_h, body) -> list:
+    """Collect, in document order, the heading and everything after it.
+
+    Walks ref_h -> body: the heading and its following siblings, then each
+    ancestor's following siblings up to (excluding) body. This is exactly the
+    tail the old strip path deleted; here we return it so it can be moved into a
+    separate document instead of dropped.
+    """
+    tail = [ref_h, *ref_h.itersiblings()]
+    node = ref_h.getparent()
+    while node is not None and node is not body:
+        tail.extend(node.itersiblings())
+        node = node.getparent()
+    return tail
+
+
+def _new_references_doc(src_head, nodes: list) -> etree._ElementTree:
+    """Build a standalone references.xhtml around the moved `nodes`.
+
+    Minimal head: a title plus the source document's stylesheet <link>s (so the
+    split-off page keeps the same styling). Appending `nodes` moves them out of
+    the source tree, which is what the caller wants.
+    """
+    nsmap = {None: _XHTML_NS}
+    root = etree.Element(f"{{{_XHTML_NS}}}html", nsmap=nsmap)
+    head = etree.SubElement(root, f"{{{_XHTML_NS}}}head")
+    title = etree.SubElement(head, f"{{{_XHTML_NS}}}title")
+    title.text = "References"
+    if src_head is not None:
+        for link in src_head.findall(f"{{{_XHTML_NS}}}link"):
+            head.append(deepcopy(link))
+    doc_body = etree.SubElement(root, f"{{{_XHTML_NS}}}body")
+    for node in nodes:
+        doc_body.append(node)
+    return etree.ElementTree(root)
+
+
+def _register_in_opf(epub_dir: Path, ref_path: Path, idref: str) -> None:
+    """Add references.xhtml to the OPF manifest and append it to the spine."""
+    opf_path = next(iter(sorted(epub_dir.rglob("*.opf"))), None)
+    if opf_path is None:
+        print("  warning: no OPF found; references.xhtml not registered", file=sys.stderr)
+        return
+    tree = etree.parse(str(opf_path))
+    root = tree.getroot()
+    ns = etree.QName(root).namespace
+
+    def q(tag: str) -> str:
+        return f"{{{ns}}}{tag}" if ns else tag
+
+    manifest = root.find(q("manifest"))
+    spine = root.find(q("spine"))
+    if manifest is None or spine is None:
+        print("  warning: OPF has no manifest/spine; references.xhtml not registered", file=sys.stderr)
+        return
+
+    href = ref_path.relative_to(opf_path.parent).as_posix()
+    item = etree.SubElement(manifest, q("item"))
+    item.set("id", idref)
+    item.set("href", href)
+    item.set("media-type", "application/xhtml+xml")
+    itemref = etree.SubElement(spine, q("itemref"))
+    itemref.set("idref", idref)
+    tree.write(str(opf_path), encoding="utf-8", xml_declaration=True)
+
+
+def _split_references(epub_dir: Path) -> str:
+    """Move the References/Bibliography section into its own spine document.
+
+    pdf_craft + pandoc emit the whole paper as one flat xhtml, so there is no
+    separate spine item the translator's `exclude_spine_ids` can reach. To keep
+    the bibliography in the final book but out of translation, we split it into a
+    `references.xhtml` document and register it in the OPF; the translator then
+    excludes it by idref (see translate_book.yaml) while it stays in the output.
+
+    Strategy: find the References heading, then move it and everything after it
+    in document order (walking up the ancestor chain, so the cut stays clean even
+    when the whole body is wrapped in a single <section>, which is what pandoc
+    produces) into the new document. A safety check leaves everything in place if
+    the cut would gut the source document, so a mis-detected heading can't empty it.
+    """
+    for xhtml in sorted(epub_dir.rglob("*.xhtml")):
+        tree = etree.parse(str(xhtml))
+        root = tree.getroot()
+        body = root.find(f"{{{_XHTML_NS}}}body")
+        if body is None:
+            continue
+
+        ref_h = None
+        for level in range(1, 7):
+            for h in body.iter(f"{{{_XHTML_NS}}}h{level}"):
+                text = "".join(h.itertext()).strip().lower()
+                text = re.sub(r"^[ivxlcdm0-9]+[.\s]+", "", text)  # drop "viii. "/"8 "
+                if text in _REFERENCE_TITLES:
+                    ref_h = h
+                    break
+            if ref_h is not None:
+                break
+        if ref_h is None:
+            continue
+
+        tail = _tail_from_heading(ref_h, body)
+        before = len(etree.tostring(body))
+        tail_bytes = sum(len(etree.tostring(n)) for n in tail)
+        after = before - tail_bytes
+        if after < 2000 or after < before * 0.15:
+            print(
+                f"  warning: split-references would gut {xhtml.name} "
+                f"({before} -> ~{after} bytes); leaving references in place.",
+                file=sys.stderr,
+            )
+            return "over-cut guarded; references kept"
+
+        # Move the tail into a new document (appending detaches it from source).
+        src_head = root.find(f"{{{_XHTML_NS}}}head")
+        ref_tree = _new_references_doc(src_head, tail)
+        ref_path = xhtml.parent / "references.xhtml"
+        ref_tree.write(str(ref_path), encoding="utf-8", xml_declaration=True)
+        tree.write(str(xhtml), encoding="utf-8", xml_declaration=True)
+        _register_in_opf(epub_dir, ref_path, "references")
+        return f"split from {xhtml.name} into {ref_path.name} ({before} -> {after} bytes)"
+
+    return "no References heading found; nothing split"
+
+
 def _repackage_epub(epub_dir: Path, epub_path: Path) -> None:
     """Rebuild the EPUB zip with mimetype stored first and uncompressed."""
     if epub_path.exists():
@@ -150,6 +283,7 @@ def convert(
     work_dir: Path | None = None,
     keep_work: bool = False,
     title: str | None = None,
+    split_references: bool = False,
 ) -> Path:
     """Run the full PDF -> clean EPUB pipeline. Returns the EPUB path."""
     _check_pandoc()
@@ -211,6 +345,10 @@ def convert(
     removed = _strip_annotations(epub_extract)
     print(f"      removed {removed} annotation(s)", flush=True)
 
+    if split_references:
+        print("[5b/6] splitting off References section", flush=True)
+        print(f"      {_split_references(epub_extract)}", flush=True)
+
     print("[6/6] repackaging EPUB", flush=True)
     _repackage_epub(epub_extract, epub_path)
 
@@ -239,6 +377,14 @@ def main(argv: list[str] | None = None) -> None:
         "--keep-work", action="store_true",
         help="keep the intermediate work directory for debugging",
     )
+    p.add_argument(
+        "--split-references", "--strip-references", dest="split_references",
+        action="store_true",
+        help="move the References/Bibliography section into its own spine "
+             "document (references.xhtml) so the translator can exclude it from "
+             "translation while it stays in the book; recommended for papers, "
+             "safe no-op if none is found. --strip-references is a kept alias.",
+    )
     args = p.parse_args(argv)
 
     if not args.pdf.is_file():
@@ -249,6 +395,7 @@ def main(argv: list[str] | None = None) -> None:
         epub_path=epub_path,
         ocr_size=args.ocr_size,
         keep_work=args.keep_work,
+        split_references=args.split_references,
     )
 
 
