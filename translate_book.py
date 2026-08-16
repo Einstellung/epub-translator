@@ -2,8 +2,10 @@
 
 Pipeline:
   1. (optional) build/load a book-level glossary  -> glossary.py
-  2. (optional) make a spine-trimmed copy of the EPUB so excluded
-     documents (endnotes, index, ...) are skipped
+  2. detect the book's front matter (cover / title page / copyright /
+     dedication / contents / preface / part dividers) -> front_matter.py
+  3. (optional) make a spine-trimmed copy of the EPUB so excluded
+     documents (front matter, endnotes, index, ...) are skipped
   3. translate with a live tqdm progress bar
 
 Usage:
@@ -22,7 +24,9 @@ from dotenv import load_dotenv
 from epub_translator import SubmitKind, language, translate
 from tqdm import tqdm
 
+import front_matter as front_matter_mod
 import glossary as glossary_mod
+import mask_code as mask_code_mod
 import mask_math as mask_math_mod
 from main import (
     DEFAULT_USER_PROMPT,
@@ -40,6 +44,9 @@ DEFAULTS = {
     "max_group_tokens": 2600,
     "glossary": {"enabled": True, "path": "", "auto_generate": True, "min_freq": 2},
     "mask_math": True,
+    "mask_code": True,
+    "skip_front_matter": True,
+    "front_matter_keep_ids": [],
     "exclude_spine_ids": [],
     "cache_path": "",
     "user_prompt": "",
@@ -226,21 +233,50 @@ def main() -> None:
     base_prompt = cfg["user_prompt"] or DEFAULT_USER_PROMPT
     user_prompt = compose_user_prompt(base_prompt, glossary_path)
 
+    # 1b. FRONT MATTER: books start with pages nobody wants translated — cover,
+    #     praise, title page, copyright, dedication, contents, preface and the
+    #     bare "Part I" divider. Detecting them automatically (default on) means
+    #     no per-book hand-maintained list; the detector prints its verdict and
+    #     the layer behind it for every spine document so a misjudgement is
+    #     visible before a single token is spent. `front_matter_keep_ids` forces
+    #     individual documents back into translation; `skip_front_matter: false`
+    #     turns the whole thing off and restores the hand-listed behaviour.
+    exclude_ids = list(cfg["exclude_spine_ids"])
+    if cfg.get("skip_front_matter", True):
+        print("front matter: auto-detecting (skip_front_matter: true)")
+        report = front_matter_mod.detect(source, cfg.get("front_matter_keep_ids") or [])
+        front_matter_mod.print_report(report)
+        exclude_ids += [i for i in report.excluded_ids if i not in exclude_ids]
+
     # 2. spine trim (excluded docs)
     translate_source = source
-    if cfg["exclude_spine_ids"]:
+    if exclude_ids:
         trimmed = Path(cache_path).with_suffix(".body.epub")
         Path(cache_path).mkdir(parents=True, exist_ok=True)
-        translate_source = trim_spine(source, cfg["exclude_spine_ids"], trimmed)
+        translate_source = trim_spine(source, exclude_ids, trimmed)
 
-    # 2b. MASK math: replace every <math> element with an inert sentinel token so
-    #     the translator never sees (and never mangles/flattens) the MathML. The
-    #     original formulas are restored verbatim after translation (see step 4).
-    #     Without this, epub_translator LaTeX-ifies math via mathml2latex: inline
-    #     math comes back as unrenderable <m:math> and display math/matrices leak
-    #     as literal `$$...$$` text. Set `mask_math: false` in the config to skip.
+    # 2b. MASK math, then MASK code. Both replace content the LLM must never see
+    #     with inert placeholders, and both put the ORIGINAL bytes back after
+    #     translation (step 4).
+    #       math  - epub_translator LaTeX-ifies <math> via mathml2latex: inline
+    #               math comes back as unrenderable <m:math> and display math /
+    #               matrices leak as literal `$$...$$` text.
+    #       code  - "please don't translate code" in the prompt is not a
+    #               guarantee; a single chapter here has 1366 inline <code>
+    #               elements, and one slip renames an identifier in the Chinese
+    #               text or collapses the inline markup.
+    #     ORDER: mask math first, code second; restore in the REVERSE order
+    #     (LIFO, see step 4). The two placeholder alphabets are mutually inert
+    #     (a MATHPLACEHOLDER sentinel contains no <pre>/<code> markup, a code
+    #     placeholder contains no <math>), so masking could run either way
+    #     round; but whichever masker runs LAST captures the other's sentinels
+    #     inside its own mapping (a <math> inside a <pre> is already a math
+    #     sentinel when the <pre> is captured), and those sentinels only return
+    #     to the document when that mapping is restored — so the last masker
+    #     must be the first restorer.
+    #     Set `mask_math: false` / `mask_code: false` in the config to skip.
     math_mapping: dict[int, str] = {}
-    translate_target = output
+    code_mapping: dict[int, str] = {}
     if cfg.get("mask_math", True):
         Path(cache_path).mkdir(parents=True, exist_ok=True)
         masked = Path(cache_path) / f"{source.stem}.masked.epub"
@@ -248,8 +284,22 @@ def main() -> None:
         print(f"math: masked {n_masked} <math> element(s) before translation")
         if n_masked:
             translate_source = masked
-            # translate into a temp file, then restore math into `output`
-            translate_target = Path(cache_path) / f"{source.stem}.translated.epub"
+        else:
+            math_mapping = {}
+    if cfg.get("mask_code", True):
+        Path(cache_path).mkdir(parents=True, exist_ok=True)
+        masked = Path(cache_path) / f"{source.stem}.masked-code.epub"
+        code_mapping, n_masked = mask_code_mod.mask_epub(translate_source, masked)
+        print(f"code: masked {n_masked} <pre>/<code> element(s) before translation")
+        if n_masked:
+            translate_source = masked
+        else:
+            code_mapping = {}
+
+    # translate into a temp file when anything has to be restored into `output`
+    translate_target = output
+    if math_mapping or code_mapping:
+        translate_target = Path(cache_path) / f"{source.stem}.translated.epub"
 
     # 3. translate with a live progress bar
     import os
@@ -278,17 +328,35 @@ def main() -> None:
     bar.update(max(0.0, 100 - last))
     bar.close()
 
-    # 4. RESTORE math: put the original MathML back in place of every sentinel
-    #    token (each appears >=1x; append-block duplicates it, so restore ALL).
+    # 4. RESTORE, in the reverse order of masking (code first, then math — see
+    #    step 2b). Every placeholder is put back at EVERY occurrence: append-block
+    #    keeps the source block and appends its translation, so an inline
+    #    placeholder shows up at least twice and restoring only the first would
+    #    lose the code/formula from the translated half of the book.
+    stages = []
+    if code_mapping:
+        stages.append(("code", mask_code_mod.restore_epub, code_mapping))
     if math_mapping:
-        restored = mask_math_mod.restore_epub(translate_target, output, math_mapping)
-        print(f"math: restored {restored} MathML occurrence(s) into {output}")
+        stages.append(("math", mask_math_mod.restore_epub, math_mapping))
+
+    current = translate_target
+    for i, (name, restore_epub, mapping) in enumerate(stages):
+        is_last = i == len(stages) - 1
+        dest = output if is_last else Path(cache_path) / f"{source.stem}.restored-{name}.epub"
+        restored = restore_epub(current, dest, mapping)
+        print(f"{name}: restored {restored} occurrence(s) of {len(mapping)} element(s)")
+        # Every masked element must come back at least once; fewer occurrences
+        # than elements means the translator dropped a placeholder and that
+        # formula/listing is missing from the book.
+        if restored < len(mapping):
+            print(f"  WARNING: {len(mapping) - restored} {name} placeholder(s) never came back")
+        current = dest
 
     # 5. RESTORE spine: excluded docs were dropped from the spine only to keep
     #    them out of translation; put them back so they stay in the reading order
     #    (present but untranslated), not orphaned in the archive.
-    if cfg["exclude_spine_ids"]:
-        restored_ids = restore_spine(output, source, cfg["exclude_spine_ids"])
+    if exclude_ids:
+        restored_ids = restore_spine(output, source, exclude_ids)
         print(f"spine: restored excluded docs into output: {restored_ids or 'none'}")
 
     print(f"\n✅ converted: {output}")

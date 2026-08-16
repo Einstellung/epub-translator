@@ -6,6 +6,8 @@ from pathlib import Path
 from dotenv import load_dotenv
 from epub_translator import LLM, SubmitKind, language, translate
 
+from claude_code_llm import DEFAULT_MODEL as DEFAULT_CLAUDE_CODE_MODEL
+from claude_code_llm import ClaudeCodeLLM
 from claude_llm import ClaudeLLM
 
 
@@ -91,8 +93,41 @@ def env(name: str, default: str | None = None) -> str:
     return value
 
 
+def env_int(name: str, default: int) -> int:
+    value = os.getenv(name)
+    return int(value) if value not in (None, "") else default
+
+
+def env_float(name: str, default: float) -> float:
+    value = os.getenv(name)
+    return float(value) if value not in (None, "") else default
+
+
+# Spellings of EPUB_TRANSLATOR_PROVIDER that route through the local Claude Code CLI.
+# Kept in sync with glossary.CLAUDE_CODE_PROVIDERS so both entry points agree.
+CLAUDE_CODE_PROVIDERS = {"claude-code", "claude_code", "claudecode"}
+
+
 def build_llm() -> LLM:
-    provider = os.getenv("EPUB_TRANSLATOR_PROVIDER", "").lower()
+    provider = os.getenv("EPUB_TRANSLATOR_PROVIDER", "").strip().lower()
+
+    if provider in CLAUDE_CODE_PROVIDERS:
+        # Local headless Claude Code CLI. Deliberately reads no API key and no base URL:
+        # the `claude` binary brings its own credentials, so a .env holding nothing but
+        # EPUB_TRANSLATOR_PROVIDER=claude-code must be enough to start.
+        return ClaudeCodeLLM(
+            # `or` not a getenv default: an empty EPUB_TRANSLATOR_CLAUDE_CODE_MODEL= line
+            # in .env would otherwise send `--model ""` -> API Error 400 on every request.
+            model=os.getenv("EPUB_TRANSLATOR_CLAUDE_CODE_MODEL") or DEFAULT_CLAUDE_CODE_MODEL,
+            token_encoding=os.getenv("EPUB_TRANSLATOR_TOKEN_ENCODING", "o200k_base"),
+            timeout=env_float("EPUB_TRANSLATOR_CLAUDE_CODE_TIMEOUT", 600.0),
+            retry_times=env_int("EPUB_TRANSLATOR_CLAUDE_CODE_RETRY_TIMES", 5),
+            retry_interval_seconds=env_float("EPUB_TRANSLATOR_CLAUDE_CODE_RETRY_INTERVAL", 6.0),
+            cache_path=os.getenv("EPUB_TRANSLATOR_CACHE_PATH", ".cache/translation"),
+            max_concurrency=env_int("EPUB_TRANSLATOR_CLAUDE_CODE_MAX_CONCURRENCY", 0) or None,
+            claude_bin=os.getenv("EPUB_TRANSLATOR_CLAUDE_CODE_BIN") or None,
+        )
+
     model = env("EPUB_TRANSLATOR_MODEL")
     if provider == "anthropic" or model.startswith("claude-"):
         return ClaudeLLM(

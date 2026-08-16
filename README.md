@@ -16,6 +16,41 @@ EPUB_TRANSLATOR_BASE_URL=https://your-proxy.example.com/v1
 EPUB_TRANSLATOR_MODEL=the-model-name-supported-by-your-proxy
 ```
 
+### Alternative engine: the local Claude Code CLI
+
+Instead of an HTTP API you can drive the `claude` CLI that is already installed and
+logged in on this machine. No API key, no base URL:
+
+```bash
+EPUB_TRANSLATOR_PROVIDER=claude-code
+EPUB_TRANSLATOR_CLAUDE_CODE_MODEL=sonnet   # or opus / haiku / a full model name
+```
+
+Every translation request becomes one `claude -p` subprocess, started in an empty
+temporary directory with `--safe-mode --tools "" --max-turns 1`, so the agent has no
+tools, no MCP servers, no skills and no CLAUDE.md. It is *not* a plain translation
+model, though, and it is worth knowing why before you point it at a book:
+
+* **The harness still injects its own preamble.** Even with `--safe-mode` and
+  `--system-prompt-file`, roughly 160 tokens go in ahead of your system prompt —
+  measured: a one-character system prompt plus a one-character user turn still reports
+  163 input tokens, and asking the model to echo them back returns the product identity,
+  today's date and **the logged-in user's e-mail address**. Treat every request as
+  attributable, not anonymous.
+* **It keeps its chat reflexes.** Handed a bare short input such as `Part II` or
+  `Preface`, it answers "I notice you haven't included the source text to translate…"
+  about a third of the time. `claude_code_llm.py` therefore hardens the translation
+  system prompt and labels the user turn, and validates every response before returning
+  it, so a chat-style non-answer is retried instead of being written into `.cache`
+  forever.
+
+Requests go through the same on-disk cache, so a crashed run resumes. Ctrl-C is safe:
+SIGINT/SIGTERM kill every live `claude` process group and remove its temp directory
+before exiting. Measured on this machine: ~4s per short request, and 8 concurrent
+requests also finish in ~4s total; each process is ~290MB resident, so cap them with
+`EPUB_TRANSLATOR_CLAUDE_CODE_MAX_CONCURRENCY` on a small machine. See `.env.example`
+for the timeout/retry knobs.
+
 ### Convert
 
 Put EPUB files in `input/`, then run:
@@ -67,9 +102,30 @@ glossary:
   enabled: true
   auto_generate: true     # extract + resolve a glossary from the book on first run
   min_freq: 2
-exclude_spine_ids: []     # spine ids to skip (e.g. endnotes, index); [] = none
+skip_front_matter: true   # auto-skip cover/title/copyright/dedication/toc/preface/part pages
+exclude_spine_ids: []     # extra spine ids to skip (e.g. endnotes, index); [] = none
 user_prompt: |            # appended to the system prompt — domain/style hints
   这是一本机器人学技术书，术语统一、公式与代码原文保留。
+```
+
+### 前置页面默认不翻译
+
+翻译从正文第一章开始。封面、赞誉/题献页、书名页、版权页、目录、前言，以及只有一行标题的
+Part 分隔页，`front_matter.py` 会自动识别并跳过——它们照旧原样留在成品的阅读顺序里，只是不译。
+
+识别分层，从权威到启发式：nav `landmarks` → OPF `<guide>` → 文档自己的 `epub:type` →
+spine id/文件名 → 体量。"正文从哪开始"的指针（`landmarks bodymatter`、`guide type="text"`）
+只在它没指向一个本身就是前置页面的文档时才采信——实测 O'Reilly 把 `type="text"` 指到书名页、
+企鹅兰登把 `bodymatter` 指到题献页，照单全收就会漏排一半前置页。安全上宁可漏排不可错排：
+泛泛的 `epub:type="frontmatter"` 单独不足以排除（Reentry 的 7000 字 Prologue 就挂着这个标），
+文件名匹配对长文档不生效，前置页面只能是 spine 的连续前缀。
+
+每本书跑之前都会把 9 行/26 行的判定表打印出来（每个文档：排还是留、依据哪一层），误判一眼可见。
+误判时用 `front_matter_keep_ids: [该文档的 spine id]` 强制翻译它，或 `skip_front_matter: false`
+整个关掉。单独审计一本书：
+
+```bash
+uv run python front_matter.py "input/My Book.epub"
 ```
 
 Every term/name in the glossary is rendered consistently across the whole book.
@@ -154,5 +210,33 @@ the YAML config to opt out. `fix_epub_math.py` remains as a fallback repair for
 EPUBs produced by the older `main.py` path (it only re-namespaces surviving
 `<m:math>` and cannot recover display math that already leaked to LaTeX; the
 mask wrapper prevents the leak in the first place).
+
+### Code is never translated
+
+Same trick, applied to source code (`mask_code.py`, on by default). Telling the
+LLM "don't translate code" is not a guarantee: one chapter of *Hands-On Large
+Language Models* carries 1,366 inline `<code>` elements, and a single slip
+renames an identifier inside the Chinese text or collapses the inline markup
+when the paragraph is re-assembled. So the model never sees the code:
+
+* every **`<pre>` listing** (including the `<code>` spans nested in it) is
+  swapped for an EMPTY `<pre data-codemask="N"></pre>`. Empty means the
+  translator never visits it, which is what keeps append-block from emitting
+  every listing twice — the block passes through untouched and is restored
+  exactly once, in place;
+* every **inline `<code>`** becomes a `CODEPLACEHOLDERnnnnnX` sentinel that
+  stays inside the sentence, so the prose around it is still translated with
+  the code pinned at its original position.
+
+Afterwards the ORIGINAL bytes are put back at every occurrence — entities,
+whitespace and syntax-highlight spans included — so the code in the output is
+byte-for-byte the code in the source. Round-tripping the reference book without
+an LLM (844 elements: 55 `<pre>` blocks + 789 inline `<code>`) reproduces the
+source EPUB byte-identically.
+
+Set `mask_code: false` in the YAML config to opt out. The two maskers stack:
+math is masked first and code second, and they are restored in the reverse
+order (code, then math), because the second masker can capture the first one's
+sentinels inside its mapping (a `<math>` inside a `<pre>`).
 
 

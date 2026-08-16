@@ -15,10 +15,12 @@ import argparse
 import json
 import os
 import re
+import sys
 import time
 import zipfile
 import xml.etree.ElementTree as ET
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from html.parser import HTMLParser
 from pathlib import Path
 from posixpath import join as posixjoin, normpath
@@ -245,18 +247,50 @@ def _completions_url(base: str) -> str:
     return f"{base}/v1/chat/completions"
 
 
+# EPUB_TRANSLATOR_PROVIDER values that route through the local Claude Code CLI.
+CLAUDE_CODE_PROVIDERS = {"claude-code", "claude_code", "claudecode"}
+
+
 def llm_chat(system: str, user: str, *, max_tokens: int = 4096, timeout: float = 300.0,
              max_retries: int = 5) -> str:
-    """One non-streaming chat turn against the OpenAI- or Anthropic-style proxy.
+    """One non-streaming chat turn against the configured backend.
 
-    Retries transient failures (gateway timeouts 502/503/504/524, rate limit 429,
+    Three backends, picked by EPUB_TRANSLATOR_PROVIDER:
+      * "claude-code"          -> local `claude -p` CLI (no key / base URL needed)
+      * "anthropic" (or a claude-* model with no provider set) -> /v1/messages
+      * anything else          -> OpenAI-style /v1/chat/completions
+
+    The HTTP paths retry transient failures (gateway timeouts 502/503/504/524, rate limit 429,
     and connection/read errors) with exponential backoff, so a single network
     hiccup during a long glossary run doesn't kill the whole process.
     """
+    provider = os.getenv("EPUB_TRANSLATOR_PROVIDER", "").strip().lower()
+
+    if provider in CLAUDE_CODE_PROVIDERS:
+        # Local Claude Code CLI: no API key, no base URL, its own retry loop.
+        # Imported lazily so the two HTTP paths keep working even if the module
+        # is absent.
+        from claude_code_llm import run_claude_cli
+
+        # This bypasses ClaudeCodeExecutor entirely, which is why
+        # EPUB_TRANSLATOR_CLAUDE_CODE_MAX_CONCURRENCY used not to apply to the glossary
+        # stage at all. The cap now lives inside run_claude_cli itself (module-level
+        # semaphore), so it binds here too; `prepare_backend()` above only pre-seeds it
+        # from the main thread.
+        return run_claude_cli(
+            system,
+            user,
+            model=os.getenv("EPUB_TRANSLATOR_CLAUDE_CODE_MODEL") or "sonnet",
+            timeout=timeout,
+            retry_times=max_retries,
+            retry_interval_seconds=float(
+                os.getenv("EPUB_TRANSLATOR_CLAUDE_CODE_RETRY_INTERVAL", "6")
+            ),
+        )
+
     key = _env("EPUB_TRANSLATOR_API_KEY")
     base = _env("EPUB_TRANSLATOR_BASE_URL")
     model = _env("EPUB_TRANSLATOR_MODEL")
-    provider = os.getenv("EPUB_TRANSLATOR_PROVIDER", "").lower()
     use_claude = provider == "anthropic" or (not provider and model.startswith("claude-"))
 
     if use_claude:
@@ -347,31 +381,178 @@ def _parse_json_array(text: str) -> list[dict]:
         raise
 
 
-def resolve_terms(terms: list[tuple[str, str]], batch_size: int = 20, timeout: float = 300.0) -> dict[str, dict]:
-    """terms: [(en, context)] -> {en: {zh, confidence, alt, note}}."""
-    resolved: dict[str, dict] = {}
-    for start in range(0, len(terms), batch_size):
-        batch = terms[start : start + batch_size]
-        payload = [{"en": en, "context": ctx} for en, ctx in batch]
-        user = (
-            "Resolve these terms to Simplified Chinese. Return one JSON object per term, "
-            "same order:\n" + json.dumps(payload, ensure_ascii=False, indent=1)
-        )
+DEFAULT_GLOSSARY_CONCURRENCY = 4
+
+# Fraction of failed batches above which a partial glossary is treated as a failed run
+# rather than a slightly thinner TSV. 0.2 = "losing a fifth of the terms is not a
+# glossary any more". Override with EPUB_TRANSLATOR_GLOSSARY_MAX_FAILED_RATIO.
+DEFAULT_MAX_FAILED_BATCH_RATIO = 0.2
+
+
+class GlossaryResolutionError(RuntimeError):
+    """Too many resolution batches failed for the resulting TSV to be trustworthy."""
+
+
+def glossary_concurrency(explicit: int | None = None) -> int:
+    """Batches to resolve in parallel.
+
+    EPUB_TRANSLATOR_GLOSSARY_CONCURRENCY, else 4. Always at least 1 (0/negative/garbage
+    falls back to the default).
+
+    Deliberately NOT inherited from EPUB_TRANSLATOR_CONCURRENCY. That variable sizes the
+    *translation* stage against a proxy that is happy with 16 in flight; the glossary
+    stage is a different, burstier shape (a few dozen large JSON batches fired at once at
+    the very start of a run) and the project's own notes record right.codes answering
+    those bursts with 524s. Inheriting 16 turned a previously serial stage into a 16-way
+    burst for every existing user who never opted into anything -- a regression in the
+    default path, caused by a knob added for a different provider.
+    """
+    if explicit is not None:
+        return max(1, explicit)
+    name = "EPUB_TRANSLATOR_GLOSSARY_CONCURRENCY"
+    raw = (os.getenv(name) or "").strip()
+    if raw:
         try:
-            raw = llm_chat(RESOLVE_SYSTEM, user, timeout=timeout)
-            for row in _parse_json_array(raw):
-                en = (row.get("en") or "").strip()
-                if en:
-                    resolved[en] = {
-                        "zh": (row.get("zh") or "").strip(),
-                        "confidence": (row.get("confidence") or "").strip().lower(),
-                        "alt": (row.get("alt") or "").strip(),
-                        "note": (row.get("note") or "").strip(),
-                    }
-        except Exception as e:
-            # One bad batch shouldn't discard the whole run; skip it and continue.
-            print(f"  WARNING: batch {start}-{start + len(batch)} failed ({e}); skipping")
-        print(f"  resolved {min(start + batch_size, len(terms))}/{len(terms)}")
+            return max(1, int(raw))
+        except ValueError:
+            print(f"  WARNING: {name}={raw!r} is not an integer; ignoring")
+    return DEFAULT_GLOSSARY_CONCURRENCY
+
+
+def _max_failed_batch_ratio() -> float:
+    raw = (os.getenv("EPUB_TRANSLATOR_GLOSSARY_MAX_FAILED_RATIO") or "").strip()
+    if raw:
+        try:
+            return max(0.0, min(1.0, float(raw)))
+        except ValueError:
+            print(f"  WARNING: EPUB_TRANSLATOR_GLOSSARY_MAX_FAILED_RATIO={raw!r} is not a number")
+    return DEFAULT_MAX_FAILED_BATCH_RATIO
+
+
+def prepare_backend() -> None:
+    """Main-thread set-up the worker threads cannot do for themselves.
+
+    Only the claude-code backend needs it: its SIGINT/SIGTERM handlers can only be
+    installed from the main thread, and every `run_claude_cli` below happens on a pool
+    thread. Without this, Ctrl-C during glossary resolution leaves the `claude`
+    subprocesses orphaned exactly as it used to.
+    """
+    provider = os.getenv("EPUB_TRANSLATOR_PROVIDER", "").strip().lower()
+    if provider not in CLAUDE_CODE_PROVIDERS:
+        return
+    try:
+        from claude_code_llm import install_signal_handlers, set_max_concurrency
+    except ImportError:
+        return
+    install_signal_handlers()
+    raw_cap = (os.getenv("EPUB_TRANSLATOR_CLAUDE_CODE_MAX_CONCURRENCY") or "").strip()
+    if raw_cap:
+        try:
+            set_max_concurrency(int(raw_cap))
+        except ValueError:
+            print(f"  WARNING: EPUB_TRANSLATOR_CLAUDE_CODE_MAX_CONCURRENCY={raw_cap!r} is not an integer")
+
+
+def _resolve_batch(batch: list[tuple[str, str]], timeout: float) -> dict[str, dict]:
+    """One LLM call for one batch. Runs in a worker thread; touches no shared state."""
+    payload = [{"en": en, "context": ctx} for en, ctx in batch]
+    user = (
+        "Resolve these terms to Simplified Chinese. Return one JSON object per term, "
+        "same order:\n" + json.dumps(payload, ensure_ascii=False, indent=1)
+    )
+    raw = llm_chat(RESOLVE_SYSTEM, user, timeout=timeout)
+    out: dict[str, dict] = {}
+    for row in _parse_json_array(raw):
+        en = (row.get("en") or "").strip()
+        if en:
+            out[en] = {
+                "zh": (row.get("zh") or "").strip(),
+                "confidence": (row.get("confidence") or "").strip().lower(),
+                "alt": (row.get("alt") or "").strip(),
+                "note": (row.get("note") or "").strip(),
+            }
+    return out
+
+
+def resolve_terms(
+    terms: list[tuple[str, str]],
+    batch_size: int = 20,
+    timeout: float = 300.0,
+    concurrency: int | None = None,
+) -> dict[str, dict]:
+    """terms: [(en, context)] -> {en: {zh, confidence, alt, note}}.
+
+    Batches are independent, so they run concurrently on a thread pool (each is a
+    blocking HTTP/subprocess call, so threads are the right tool). Each worker
+    builds its own dict and its own exception is caught per batch, so one bad
+    batch only loses that batch -- same semantics as the old serial loop. Results
+    are merged back in batch order, so the output does not depend on which
+    request happened to finish first.
+
+    A few lost batches are survivable and only produce a summary. Losing more than
+    EPUB_TRANSLATOR_GLOSSARY_MAX_FAILED_RATIO of them raises `GlossaryResolutionError`
+    instead of returning: a WARNING per batch scrolls past, and the caller would
+    otherwise write the gap-riddled TSV, exit 0, and have `ensure_glossary()` reuse that
+    file unquestioned on every later run. In the worst case -- CLI missing, not logged
+    in, proxy down -- *every* batch fails, and the old code produced a glossary with an
+    empty Chinese column for the whole book and reported success.
+    """
+    if not terms:
+        return {}
+    prepare_backend()
+    batches = [terms[start : start + batch_size] for start in range(0, len(terms), batch_size)]
+    workers = min(glossary_concurrency(concurrency), len(batches))
+
+    def run(index: int) -> tuple[int, dict[str, dict], str | None]:
+        batch = batches[index]
+        try:
+            return index, _resolve_batch(batch, timeout), None
+        except Exception as e:  # noqa: BLE001 - one bad batch must not kill the pool
+            return index, {}, f"{type(e).__name__}: {e}"
+
+    parts: dict[int, dict[str, dict]] = {}
+    errors: dict[int, str] = {}
+    done_terms = 0
+    print(f"  resolving {len(terms)} terms in {len(batches)} batch(es), concurrency {workers}")
+    with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="glossary") as pool:
+        futures = [pool.submit(run, i) for i in range(len(batches))]
+        # Results are consumed on the main thread only: no shared dict, no lock,
+        # and progress lines never interleave.
+        for done, future in enumerate(as_completed(futures), start=1):
+            index, part, error = future.result()
+            parts[index] = part
+            done_terms += len(batches[index])
+            if error:
+                errors[index] = error
+                first = sum(len(b) for b in batches[:index])
+                print(
+                    f"  WARNING: batch {first}-{first + len(batches[index])} "
+                    f"failed ({error}); skipping"
+                )
+            print(f"  resolved {done_terms}/{len(terms)} terms ({done}/{len(batches)} batches)")
+
+    if errors:
+        lost = sum(len(batches[i]) for i in sorted(errors))
+        print(
+            f"  ERROR: {len(errors)}/{len(batches)} resolution batch(es) failed, "
+            f"{lost}/{len(terms)} term(s) left unresolved"
+        )
+        for index in sorted(errors):
+            first = sum(len(b) for b in batches[:index])
+            print(f"    batch {first}-{first + len(batches[index])}: {errors[index]}")
+        ratio = len(errors) / len(batches)
+        limit = _max_failed_batch_ratio()
+        if ratio > limit:
+            raise GlossaryResolutionError(
+                f"{len(errors)}/{len(batches)} glossary batches failed "
+                f"({ratio:.0%} > {limit:.0%} allowed); refusing to write a glossary that "
+                f"is missing {lost} of {len(terms)} terms. First error: {errors[sorted(errors)[0]]}"
+            )
+        print(f"  WARNING: continuing with a partial glossary ({ratio:.0%} of batches lost)")
+
+    resolved: dict[str, dict] = {}
+    for index in range(len(batches)):
+        resolved.update(parts.get(index, {}))
     return resolved
 
 
@@ -561,6 +742,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--max-terms", type=int, default=400, help="Cap candidates sent for resolution")
     p.add_argument("--batch-size", type=int, default=20, help="Terms per LLM resolution call")
     p.add_argument("--timeout", type=float, default=300.0, help="Per-request timeout (seconds)")
+    p.add_argument(
+        "-j", "--concurrency", type=int, default=None,
+        help="Resolution batches in flight at once. Default: "
+             f"$EPUB_TRANSLATOR_GLOSSARY_CONCURRENCY, else {DEFAULT_GLOSSARY_CONCURRENCY} "
+             "(deliberately not $EPUB_TRANSLATOR_CONCURRENCY)",
+    )
     p.add_argument("--no-resolve", action="store_true", help="Extract candidates only; no API calls")
     p.add_argument("--no-reconcile", action="store_true", help="Skip the dedup/consistency pass")
     p.add_argument("--keep-skipped", action="store_true", help="Keep entries the model marks as noise")
@@ -602,6 +789,7 @@ def main() -> None:
             [(e["en"], e["context"]) for e in entries],
             batch_size=args.batch_size,
             timeout=args.timeout,
+            concurrency=args.concurrency,
         )
         for e in entries:
             r = resolved.get(e["en"], {})
@@ -627,4 +815,11 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except GlossaryResolutionError as err:
+        # Explicit non-zero exit: a mostly-empty glossary that "succeeded" is worse than
+        # no glossary, because ensure_glossary() will reuse the file forever.
+        print(f"\nERROR: glossary resolution failed: {err}", file=sys.stderr)
+        print("No TSV was written. Fix the backend and re-run.", file=sys.stderr)
+        raise SystemExit(2) from None

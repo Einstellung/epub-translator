@@ -98,7 +98,9 @@ def mask_epub(src: Path, dst: Path) -> tuple[dict[int, str], int]:
     counter = 0
 
     for html_path in _content_files(work):
-        html = html_path.read_text(encoding="utf-8")
+        # bytes, not read_text(): text mode would silently rewrite CRLF line
+        # endings to LF and break the byte-for-byte guarantee.
+        html = html_path.read_bytes().decode("utf-8")
         if "<math" not in html:
             continue
 
@@ -109,7 +111,7 @@ def mask_epub(src: Path, dst: Path) -> tuple[dict[int, str], int]:
             return _token(counter)
 
         new_html = _MATH_RE.sub(repl, html)
-        html_path.write_text(new_html, encoding="utf-8")
+        html_path.write_bytes(new_html.encode("utf-8"))
 
     _repackage(work, dst)
     shutil.rmtree(work, ignore_errors=True)
@@ -154,12 +156,12 @@ def restore_epub(src: Path, dst: Path, mapping: dict[int, str]) -> int:
 
     total = 0
     for html_path in _content_files(work):
-        html = html_path.read_text(encoding="utf-8")
+        html = html_path.read_bytes().decode("utf-8")
         if _TOKEN_PREFIX not in html.upper():
             continue
         new_html, n = restore_text(html, mapping)
         if n:
-            html_path.write_text(new_html, encoding="utf-8")
+            html_path.write_bytes(new_html.encode("utf-8"))
             total += n
 
     _repackage(work, dst)

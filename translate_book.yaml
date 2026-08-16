@@ -22,8 +22,19 @@ glossary:
   auto_generate: true           # path 不存在时，先自动从本书抽取生成术语表
   min_freq: 2                   # 自动生成时，词频低于此值的候选丢弃（整本书建议 2）
 
+# ── 前置页面（封面/书名页/版权页/题献/目录/前言/Part 分隔页）──────
+# 默认自动识别并跳过，从正文第一章开始翻译；跳过的页面仍原样保留在成品里。
+# 判定依据（nav landmarks / OPF guide / epub:type / 文件名 / 体量）会逐项打印，
+# 跑之前先看一眼那张表就知道排了什么、为什么排。
+skip_front_matter: true
+# 某一页被误判成前置页面时，在这里写它的 spine id，强制翻译它：
+front_matter_keep_ids: []
+# 只想审计不想翻译时，可以单独跑：
+#   uv run python front_matter.py "input/某本书.epub"
+
 # ── 排除章节（spine id，不翻译这些文档）─────────────────
 # 尾注、索引等翻了对双语阅读价值不大，默认排除。
+# 这里写的和上面自动识别出来的前置页面会叠加。
 exclude_spine_ids:
   - endnotes
   - index
