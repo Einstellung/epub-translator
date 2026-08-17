@@ -1,0 +1,58 @@
+# configs/hands-on-llms.yaml —《Hands-On Large Language Models》(Jay Alammar,
+#   Maarten Grootendorst) 第 1–3 章 双语翻译配置
+# 用法：  uv run python translate_book.py configs/hands-on-llms.yaml
+#
+# 源文件说明：原书 24 个 spine 文档 / 21.4 MB，已用 truncate_epub.py 截成
+# 前置页 + 第 1–3 章（9 个文档 / 6.98 MB，未引用的 203 张插图已剪除）。
+# 书中 44 处指向已删章节的交叉引用（"见第 12 章"）已降级为纯文本，
+# 所以译文里仍会读到指向本册不存在内容的表述——这是截断样本的固有代价。
+
+source: "input/Hands-On Large Language Models (ch1-3).epub"
+output: "output/Hands-On大语言模型_第1-3章_中英对照.epub"
+
+language: zh
+submit: append-block
+concurrency: 16
+max_group_tokens: 2600
+
+# ── 术语表 ──────────────────────────────────────────────
+# 本书术语密度极高（transformer/embedding/token/attention…），
+# 全书统一译法对可读性影响很大，务必开启。
+glossary:
+  enabled: true
+  auto_generate: true
+  min_freq: 3          # 三章体量不大，阈值 3 避免收进太多长尾噪声
+
+# ── 代码与公式不翻译 ────────────────────────────────────
+# 这是 O'Reilly 技术书：ch01 4×<pre>/159×<code>，
+# ch02 34×<pre>/1366×<code>（行内代码密度最高），ch03 15×<pre>/328×<code>。
+# mask_code 在送进模型前把它们换成哨兵，模型根本看不到代码，译完原样还原。
+mask_code: true
+mask_math: true
+
+# ── 前置页不翻译 ────────────────────────────────────────
+# 封面/题献/书名页/版权页/前言/Part 标题页自动识别并排除，从正文第一章开始译。
+# 被排除的文档仍完整保留在成品里，只是不带中文。
+skip_front_matter: true
+exclude_spine_ids: []
+
+cache_path: ""
+
+# ── 翻译风格 ────────────────────────────────────────────
+user_prompt: |
+  这是一本面向工程师的大语言模型实战技术书（O'Reilly 出版，作者 Jay Alammar 与
+  Maarten Grootendorst），讲 LLM 的原理与动手实践，配有大量图示和 Python 代码。
+
+  - 术语统一、准确，采用中文技术社区的通行译法；首次出现用「中文（English）」，
+    之后统一用中文。例如：词元(token)、嵌入(embedding)、注意力(attention)、
+    自注意力(self-attention)、微调(fine-tuning)、提示工程(prompt engineering)、
+    检索增强生成(RAG)、语义搜索(semantic search)、文本分类(text classification)、
+    文本聚类(text clustering)、主题建模(topic modeling)、生成式(generative)。
+  - 以下一律保留英文原文，不要翻译：Transformer、BERT、GPT、LLaMA、ChatGPT 等
+    模型与架构名；Hugging Face、PyTorch、NumPy、scikit-learn 等库与产品名；
+    函数名、类名、参数名、文件名、命令、包名。
+  - 形如 CODEPLACEHOLDER00001X / MATHPLACEHOLDER0001X 的占位符是代码与公式的
+    替身，必须原样逐字保留，不得翻译、改写、增删字符或改变大小写。
+  - 图注（Figure 1-5 之类）译出说明文字，编号保留原样。
+  - 译文要通顺自然、符合中文技术写作习惯，长句适当拆分；避免翻译腔和逐词硬译。
+  - 不要summarize、不要省略、不要添加译者注或任何解释性文字。
