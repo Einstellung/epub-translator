@@ -1,0 +1,43 @@
+--- a/epub_translator/llm/error.py
++++ b/epub_translator/llm/error.py
+@@ -13,14 +13,38 @@
+     return False
+ 
+ 
++# HTTP statuses that deserve another attempt.
++#   500                 DeepSeek's docs tell clients to retry it; several proxies emit it
++#                       for transient upstream failures too.
++#   502/503/504         ordinary gateway/upstream trouble.
++#   520-527             the Cloudflare-origin 5xx range, 524 = "origin response timeout".
++#                       right.codes/codex throws these regularly on long runs.
++#   529                 "overloaded" (Anthropic and several proxies).
++# Deliberately NOT here: 400/401/403/404 (a broken request or bad credentials never
++# heals) and 402 "insufficient balance" - retrying that only burns the retry budget
++# and delays the error the user actually has to act on.
++_RETRYABLE_STATUS = frozenset(
++    {500, 502, 503, 504, 520, 521, 522, 523, 524, 525, 526, 527, 529}
++)
++
++
+ # https://help.openai.com/en/articles/6897213-openai-library-error-types-guidance
+ def _is_openai_retry_error(err: Exception) -> bool:
+     if isinstance(err, openai.Timeout):
+         return True
+     if isinstance(err, openai.APIConnectionError):
+         return True
+-    if isinstance(err, openai.InternalServerError):
+-        return err.status_code in (502, 503, 504)
++    if isinstance(err, openai.RateLimitError):
++        # 429. The openai SDK already retries this twice on its own, but with its own
++        # short backoff - not the caller's retry_times/retry_interval_seconds. A
++        # provider-side rate limit routinely outlasts those two attempts, and without
++        # this branch the whole book run dies on one 429.
++        return True
++    if isinstance(err, openai.APIStatusError):
++        # APIStatusError rather than InternalServerError: every status in the set above
++        # is >= 500 and therefore already maps to InternalServerError today, but this
++        # keeps working if the SDK ever maps one of them to a different subclass.
++        return err.status_code in _RETRYABLE_STATUS
+     return False
+ 
+ 

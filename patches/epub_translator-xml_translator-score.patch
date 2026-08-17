@@ -1,0 +1,40 @@
+--- a/epub_translator/xml_translator/score.py
++++ b/epub_translator/xml_translator/score.py
+@@ -10,6 +10,14 @@
+ _ID_WEIGHT = 80
+ _ELLIPSIS = "..."
+ 
++# Book text is arbitrary prose, not a prompt: a book *about* language models quotes
++# "<|endoftext|>" and friends as literal strings. tiktoken refuses to encode those by
++# default and raises ValueError, which kills the whole translation process mid-run with
++# no way to resume past it. disallowed_special=() makes tiktoken treat every special
++# marker as ordinary text, which is exactly what it is here - we only ever use these
++# token counts to size request groups, never to feed tokens to a model.
++_NO_SPECIAL: tuple[str, ...] = ()
++
+ 
+ @dataclass
+ class ScoreSegment:
+@@ -28,8 +36,11 @@
+                 is_first=(i == 0),
+             )
+         )
+-        score_segment.text_tokens = encoding.encode(score_segment.text_segment.text)
+-        score_segment.score = len(encoding.encode(xml_text)) + sum(
++        score_segment.text_tokens = encoding.encode(
++            score_segment.text_segment.text,
++            disallowed_special=_NO_SPECIAL,
++        )
++        score_segment.score = len(encoding.encode(xml_text, disallowed_special=_NO_SPECIAL)) + sum(
+             _ID_WEIGHT for parent in score_segment.left_parents if parent.id is not None
+         )
+         yield score_segment
+@@ -71,7 +82,7 @@
+         text_segment=text_segment,
+         left_parents=score_segment.left_parents,
+         right_parents=score_segment.right_parents,
+-        text_tokens=encoding.encode(remain_text),
++        text_tokens=encoding.encode(remain_text, disallowed_special=_NO_SPECIAL),
+         score=remain_text_tokens_count + fixed_score,
+     )
+ 

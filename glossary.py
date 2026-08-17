@@ -319,6 +319,17 @@ def llm_chat(system: str, user: str, *, max_tokens: int = 4096, timeout: float =
             ],
         }
 
+    # EPUB_TRANSLATOR_EXTRA_BODY applies here too, otherwise turning DeepSeek's thinking
+    # mode off would cover the translation stage but leave the glossary stage - a burst
+    # of a few dozen large batches - running at effort=high. Imported lazily so this
+    # module keeps working standalone. Parsing (and its error message) lives in main.py
+    # so there is exactly one place that knows the format.
+    from main import env_extra_body
+
+    extra_body = env_extra_body()
+    if extra_body:
+        payload.update(extra_body)
+
     RETRYABLE = {429, 500, 502, 503, 504, 524}
     last_err = None
     for attempt in range(max_retries):

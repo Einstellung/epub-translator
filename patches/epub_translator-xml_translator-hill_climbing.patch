@@ -1,0 +1,14 @@
+--- a/epub_translator/xml_translator/hill_climbing.py
++++ b/epub_translator/xml_translator/hill_climbing.py
+@@ -35,7 +35,10 @@
+         element = self._block_segment.create_element()
+         for child_element in element:
+             text = plain_text(child_element)
+-            tokens = self._encoding.encode(text)
++            # disallowed_special=(): see score.py. This call runs for every block of
++            # every request, so a literal "<|endoftext|>" in the source text would kill
++            # the run here instead.
++            tokens = self._encoding.encode(text, disallowed_special=())
+             child_element.set(DATA_ORIGIN_LEN_KEY, str(len(tokens)))
+         return element
+ 

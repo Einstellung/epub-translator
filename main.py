@@ -1,5 +1,6 @@
 import argparse
 import csv
+import json
 import os
 from pathlib import Path
 
@@ -103,6 +104,43 @@ def env_float(name: str, default: float) -> float:
     return float(value) if value not in (None, "") else default
 
 
+EXTRA_BODY_ENV = "EPUB_TRANSLATOR_EXTRA_BODY"
+EXTRA_BODY_EXAMPLE = '{"thinking": {"type": "disabled"}}'
+
+
+def env_extra_body() -> dict[str, object] | None:
+    """Extra JSON fields to merge into every chat-completions request body.
+
+    Deliberately provider-agnostic. The knob that matters today is DeepSeek's thinking
+    mode, which is on at effort=high by default and multiplies output cost and latency;
+    turning it off is just a request-body field. Making that a `provider == "deepseek"`
+    branch would mean a provider set to keep in sync between here and glossary.py for no
+    behavioural gain, so it is one env var that works with whatever the endpoint accepts.
+
+    Returns None when unset, in which case the request body is byte-for-byte what it
+    was before this existed.
+    """
+    raw = os.getenv(EXTRA_BODY_ENV, "").strip()
+    if not raw:
+        return None
+    try:
+        value = json.loads(raw)
+    except json.JSONDecodeError as err:
+        raise RuntimeError(
+            f"{EXTRA_BODY_ENV} is not valid JSON: {err.msg} (line {err.lineno}, column {err.colno}).\n"
+            f"  got:      {raw}\n"
+            f"  expected: a JSON object, e.g. {EXTRA_BODY_ENV}='{EXTRA_BODY_EXAMPLE}'\n"
+            f"  note:     in .env, wrap the value in single quotes so the double quotes survive."
+        ) from None
+    if not isinstance(value, dict):
+        raise RuntimeError(
+            f"{EXTRA_BODY_ENV} must be a JSON object, got {type(value).__name__}.\n"
+            f"  got:      {raw}\n"
+            f"  expected: a JSON object, e.g. {EXTRA_BODY_ENV}='{EXTRA_BODY_EXAMPLE}'"
+        )
+    return value
+
+
 # Spellings of EPUB_TRANSLATOR_PROVIDER that route through the local Claude Code CLI.
 # Kept in sync with glossary.CLAUDE_CODE_PROVIDERS so both entry points agree.
 CLAUDE_CODE_PROVIDERS = {"claude-code", "claude_code", "claudecode"}
@@ -110,8 +148,13 @@ CLAUDE_CODE_PROVIDERS = {"claude-code", "claude_code", "claudecode"}
 
 def build_llm() -> LLM:
     provider = os.getenv("EPUB_TRANSLATOR_PROVIDER", "").strip().lower()
+    # Parsed up front so a malformed value fails before the first request rather than
+    # after the glossary stage, and so the two backends that cannot honour it can say so.
+    extra_body = env_extra_body()
 
     if provider in CLAUDE_CODE_PROVIDERS:
+        if extra_body:
+            print(f"warning: {EXTRA_BODY_ENV} is set but claude-code has no HTTP request body; ignoring it")
         # Local headless Claude Code CLI. Deliberately reads no API key and no base URL:
         # the `claude` binary brings its own credentials, so a .env holding nothing but
         # EPUB_TRANSLATOR_PROVIDER=claude-code must be enough to start.
@@ -130,6 +173,8 @@ def build_llm() -> LLM:
 
     model = env("EPUB_TRANSLATOR_MODEL")
     if provider == "anthropic" or model.startswith("claude-"):
+        if extra_body:
+            print(f"warning: {EXTRA_BODY_ENV} is not supported by the anthropic backend; ignoring it")
         return ClaudeLLM(
             key=env("EPUB_TRANSLATOR_API_KEY"),
             url=env("EPUB_TRANSLATOR_BASE_URL"),
@@ -151,6 +196,7 @@ def build_llm() -> LLM:
         retry_interval_seconds=float(os.getenv("EPUB_TRANSLATOR_RETRY_INTERVAL", "6")),
         cache_path=os.getenv("EPUB_TRANSLATOR_CACHE_PATH", ".cache/translation"),
         log_dir_path=os.getenv("EPUB_TRANSLATOR_LOG_DIR", ".cache/logs"),
+        extra_body=extra_body,
     )
 
 

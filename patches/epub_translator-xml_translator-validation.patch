@@ -1,0 +1,14 @@
+--- a/epub_translator/xml_translator/validation.py
++++ b/epub_translator/xml_translator/validation.py
+@@ -451,7 +451,10 @@
+ def _extract_text_hint(encoding: Encoding, element: Element) -> str:
+     text = plain_text(element).strip()
+     if text:
+-        tokens = encoding.encode(text)
++        # disallowed_special=(): see score.py. This one only runs while building an
++        # error message, so without it a fill error on such a block would be replaced by
++        # an unrelated ValueError.
++        tokens = encoding.encode(text, disallowed_special=())
+         if len(tokens) > _MAX_TEXT_HINT_TOKENS_COUNT:
+             tokens = tokens[:_MAX_TEXT_HINT_TOKENS_COUNT]
+             text = encoding.decode(tokens).strip() + " ..."

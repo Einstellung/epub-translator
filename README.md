@@ -16,6 +16,84 @@ EPUB_TRANSLATOR_BASE_URL=https://your-proxy.example.com/v1
 EPUB_TRANSLATOR_MODEL=the-model-name-supported-by-your-proxy
 ```
 
+Then patch the dependencies (see [Local dependency patches](#local-dependency-patches) —
+this is required, and required again after every `uv sync`):
+
+```bash
+uv run python apply_patches.py
+```
+
+### Local dependency patches
+
+`epub-translator` ships two bugs that are fatal for a book-length run, fixed here in
+`patches/*.patch` rather than upstream:
+
+* **`<|endoftext|>` kills the process.** A book *about* language models quotes
+  `<|endoftext|>`, `<|fim_prefix|>` and friends as ordinary prose. `tiktoken` refuses to
+  encode those and raises `ValueError: Encountered text corresponding to disallowed
+  special token`, which takes down the whole run — measured at 60% through *Hands-On
+  Large Language Models*, with no way to resume past it. The patches pass
+  `disallowed_special=()` at all five call sites (`xml_translator/score.py` ×3,
+  `hill_climbing.py`, `validation.py`), so the markers count as the plain text they are.
+  Fixing only `score.py` just moves the crash to `hill_climbing.py`.
+* **429 / 500 / 529 were not retried.** `EPUB_TRANSLATOR_RETRY_TIMES` only ever applied
+  to 502/503/504, so a rate limit ended the run. The patch adds 429, 500 and 529 (and
+  keeps the 520–527 Cloudflare range). 402 "insufficient balance" and the 4xx credential
+  errors still fail on the first response — retrying those only delays the error you
+  have to act on.
+
+`uv sync` restores the pristine wheel and silently drops both fixes, so run this after
+every sync:
+
+```bash
+uv run python apply_patches.py           # idempotent; safe to run any time
+uv run python apply_patches.py --check   # exit 1 if anything is unpatched
+```
+
+It refuses to run outside the project virtualenv, and if a patch no longer fits (because
+the dependency was upgraded) it says so and exits non-zero instead of leaving a
+half-patched environment. Regenerate the patch against the new version before starting a
+book.
+
+Do not hand-edit files under `.venv/` instead: `uv` installs packages by *hardlinking*
+out of `~/.cache/uv/archive-v0/`, so an in-place edit also rewrites the shared uv cache
+and every other project on the machine inherits it. `apply_patches.py` always writes a
+new file and `os.replace`s it, which breaks the hardlink and leaves the cache clean.
+
+### DeepSeek
+
+DeepSeek speaks plain OpenAI chat-completions, so there is no DeepSeek provider — keep
+`EPUB_TRANSLATOR_PROVIDER=openai` and change three lines in `.env`:
+
+```bash
+EPUB_TRANSLATOR_PROVIDER=openai
+EPUB_TRANSLATOR_API_KEY=sk-your-deepseek-key
+EPUB_TRANSLATOR_BASE_URL=https://api.deepseek.com/v1
+EPUB_TRANSLATOR_MODEL=deepseek-v4-flash
+EPUB_TRANSLATOR_EXTRA_BODY='{"thinking": {"type": "disabled"}}'
+```
+
+* **The `/v1` in `BASE_URL` is not optional.** The two stages build the URL differently:
+  the translation stage hands the value to the openai SDK, which appends
+  `/chat/completions` verbatim, while `glossary.py` adds a `/v1` itself when the base
+  lacks one. Drop the `/v1` and the two stages talk to two different paths, one of which
+  404s.
+* **`deepseek-v4-flash`** is the sensible default; `deepseek-v4-pro` is the stronger,
+  pricier one. `deepseek-chat` and `deepseek-reasoner` are retired.
+* **Thinking mode is on by default at effort=high**, which costs 2–4× the output tokens
+  and a lot of latency for no benefit here — the library streams and reads only
+  `delta.content`, so reasoning text never reaches the translation either way.
+  `EPUB_TRANSLATOR_EXTRA_BODY` turns it off.
+* **Concurrency 16** is fine against `api.deepseek.com` directly; drop to 4–8 if 429s
+  start showing up.
+
+`EPUB_TRANSLATOR_EXTRA_BODY` is a general escape hatch, not a DeepSeek feature: whatever
+JSON object you put there is merged into every chat-completions request body, in both
+the glossary and the translation stage. Unset or empty, the request body is exactly what
+it was before. Malformed JSON fails at startup with the offending value quoted back at
+you, not a traceback. The `claude-code` and `anthropic` backends do not build an
+OpenAI-style body and print a warning if it is set.
+
 ### Alternative engine: the local Claude Code CLI
 
 Instead of an HTTP API you can drive the `claude` CLI that is already installed and
