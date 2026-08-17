@@ -80,12 +80,27 @@ EPUB_TRANSLATOR_EXTRA_BODY='{"thinking": {"type": "disabled"}}'
   404s.
 * **`deepseek-v4-flash`** is the sensible default; `deepseek-v4-pro` is the stronger,
   pricier one. `deepseek-chat` and `deepseek-reasoner` are retired.
-* **Thinking mode is on by default at effort=high**, which costs 2–4× the output tokens
-  and a lot of latency for no benefit here — the library streams and reads only
-  `delta.content`, so reasoning text never reaches the translation either way.
+* **Thinking mode is on by default**, and it is pure overhead here. Measured on one real
+  translation request: default = 291 reasoning tokens / 321 completion tokens / 3.4s,
+  versus 0 / 27 / 1.1s with thinking disabled — same translation quality for this job.
+  The reasoning text never reaches the translation either way (the library streams and
+  reads only `delta.content`), so it is cost and latency for nothing.
   `EPUB_TRANSLATOR_EXTRA_BODY` turns it off.
 * **Concurrency 16** is fine against `api.deepseek.com` directly; drop to 4–8 if 429s
   start showing up.
+
+**Quoting `EPUB_TRANSLATOR_EXTRA_BODY` in `.env`** — python-dotenv, as tested:
+
+| form | result |
+|---|---|
+| `EXTRA_BODY='{"thinking": {"type": "disabled"}}'` | works — **use this** |
+| `EXTRA_BODY={"thinking":{"type":"disabled"}}` | works (bare is fine) |
+| either of the above with a trailing `# comment` | works |
+| `EXTRA_BODY="{"thinking": {"type": "disabled"}}"` | **breaks** — dotenv reports "could not parse statement", drops the variable, and the run proceeds with thinking still on |
+
+Count the braces: the value needs two closing ones. A truncated value fails at startup
+with a message naming the variable and quoting the value back, before any request is
+sent — it never wastes a run.
 
 `EPUB_TRANSLATOR_EXTRA_BODY` is a general escape hatch, not a DeepSeek feature: whatever
 JSON object you put there is merged into every chat-completions request body, in both
