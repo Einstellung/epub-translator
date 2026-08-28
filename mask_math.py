@@ -37,6 +37,8 @@ import shutil
 import zipfile
 from pathlib import Path
 
+from mask_common import content_files, repackage
+
 MATHML_NS = "http://www.w3.org/1998/Math/MathML"
 
 # One <math>...</math> element (MathML never nests <math>, so non-greedy is safe).
@@ -58,28 +60,6 @@ _TOKEN_RE = re.compile(
 )
 
 
-def _content_files(root: Path) -> list[Path]:
-    return sorted(
-        p
-        for ext in ("*.xhtml", "*.html", "*.htm")
-        for p in root.rglob(ext)
-    )
-
-
-def _repackage(work: Path, dst: Path) -> None:
-    """Zip `work` into a valid EPUB: mimetype stored first & uncompressed."""
-    if dst.exists():
-        dst.unlink()
-    with zipfile.ZipFile(dst, "w", zipfile.ZIP_DEFLATED) as zf:
-        mt = work / "mimetype"
-        if mt.exists():
-            zf.writestr("mimetype", mt.read_bytes(), compress_type=zipfile.ZIP_STORED)
-        for path in sorted(work.rglob("*")):
-            if path.is_dir() or path.name == "mimetype":
-                continue
-            zf.write(path, path.relative_to(work).as_posix())
-
-
 def mask_epub(src: Path, dst: Path) -> tuple[dict[int, str], int]:
     """Replace every <math> element in `src` with a sentinel token.
 
@@ -97,7 +77,7 @@ def mask_epub(src: Path, dst: Path) -> tuple[dict[int, str], int]:
     mapping: dict[int, str] = {}
     counter = 0
 
-    for html_path in _content_files(work):
+    for html_path in content_files(work):
         # bytes, not read_text(): text mode would silently rewrite CRLF line
         # endings to LF and break the byte-for-byte guarantee.
         html = html_path.read_bytes().decode("utf-8")
@@ -113,7 +93,7 @@ def mask_epub(src: Path, dst: Path) -> tuple[dict[int, str], int]:
         new_html = _MATH_RE.sub(repl, html)
         html_path.write_bytes(new_html.encode("utf-8"))
 
-    _repackage(work, dst)
+    repackage(work, dst)
     shutil.rmtree(work, ignore_errors=True)
     return mapping, counter
 
@@ -155,7 +135,7 @@ def restore_epub(src: Path, dst: Path, mapping: dict[int, str]) -> int:
         zf.extractall(work)
 
     total = 0
-    for html_path in _content_files(work):
+    for html_path in content_files(work):
         html = html_path.read_bytes().decode("utf-8")
         if _TOKEN_PREFIX not in html.upper():
             continue
@@ -164,6 +144,6 @@ def restore_epub(src: Path, dst: Path, mapping: dict[int, str]) -> int:
             html_path.write_bytes(new_html.encode("utf-8"))
             total += n
 
-    _repackage(work, dst)
+    repackage(work, dst)
     shutil.rmtree(work, ignore_errors=True)
     return total
