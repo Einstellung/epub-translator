@@ -1,0 +1,21 @@
+# configs/tiny-table-test.yaml — mask_table 的端到端小样验证
+# 一章：两段散文 + 一个表题(<h6>) + 一个 3 列表格。
+# 期望：散文和表题有中文译文，表格原样出现一次、不被翻译也不被复制。
+# 用法：  uv run python translate_book.py configs/tiny-table-test.yaml
+source: "output/tiny_table_test.epub"
+output: "output/tiny_table_test.zh-bilingual.epub"
+language: zh
+submit: append-block
+concurrency: 4
+max_group_tokens: 2600
+glossary:
+  enabled: false
+  auto_generate: false
+mask_math: true
+mask_code: true
+mask_table: true
+skip_front_matter: false
+exclude_spine_ids: []
+cache_path: ".cache/tiny_table_test"
+user_prompt: |
+  这是测试文本。译文通顺自然，不要summarize、不要省略。

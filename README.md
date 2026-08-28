@@ -327,9 +327,43 @@ byte-for-byte the code in the source. Round-tripping the reference book without
 an LLM (844 elements: 55 `<pre>` blocks + 789 inline `<code>`) reproduces the
 source EPUB byte-identically.
 
-Set `mask_code: false` in the YAML config to opt out. The two maskers stack:
-math is masked first and code second, and they are restored in the reverse
-order (code, then math), because the second masker can capture the first one's
-sentinels inside its mapping (a `<math>` inside a `<pre>`).
+Set `mask_code: false` in the YAML config to opt out.
+
+### Tables are never translated
+
+Third masker, same shape (`mask_table.py`, on by default). `table`, `tr`, `td`
+and `th` are **not** in the translator's inline-tag set, so every single cell
+counts as its own block — and in `append-block` mode a translated copy is
+appended after every block. Inside a table that means a translated `<td>` after
+each original `<td>`: a 3-column `<thead>` comes back with **6 cells**, the
+layout collapses in the reader, and the columns that hold model names, token
+counts and years are "translated" for nothing. Even where a cell does hold
+prose, interleaving two languages cell by cell across a grid is unreadable.
+
+So a table is kept entirely in the source language: every `<table>` element is
+swapped for an EMPTY `<table data-tablemask="N"></table>` (text-free for the
+same reason as the `<pre>` placeholder — a sentinel with text would be emitted
+twice and duplicate the table), and the original markup is put back verbatim
+afterwards. The **caption** normally sits outside the element
+(`<h6>Table 3-1. …</h6>`), so it is translated like any other block and the
+reader still gets a Chinese description of what the table shows.
+
+Set `mask_table: false` in the YAML config to opt out.
+
+### How the three maskers stack
+
+Masking runs **math → code → table**; restoring runs the reverse,
+**table → code → math**. The placeholder alphabets are mutually inert, so the
+masking order is free, but whichever masker runs LAST captures the earlier
+ones' placeholders inside its own mapping (a `<math>` inside a `<pre>` is
+already a math sentinel when the `<pre>` is captured; a `<pre>` inside a table
+cell is already a code placeholder when the `<table>` is captured), and those
+placeholders only return to the document when that mapping is restored — so the
+last masker must be the first restorer (LIFO).
+
+The plumbing all three share — content-file discovery, EPUB repackaging and the
+depth-counting element scanner — lives in `mask_common.py`. Round-tripping the
+reference book through all three maskers without an LLM (844 `<pre>`/`<code>`
+elements + 4 `<table>`s) reproduces every source XHTML document byte-identically.
 
 

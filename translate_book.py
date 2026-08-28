@@ -28,6 +28,7 @@ import front_matter as front_matter_mod
 import glossary as glossary_mod
 import mask_code as mask_code_mod
 import mask_math as mask_math_mod
+import mask_table as mask_table_mod
 from main import (
     DEFAULT_USER_PROMPT,
     LANGUAGES,
@@ -45,6 +46,7 @@ DEFAULTS = {
     "glossary": {"enabled": True, "path": "", "auto_generate": True, "min_freq": 2},
     "mask_math": True,
     "mask_code": True,
+    "mask_table": True,
     "skip_front_matter": True,
     "front_matter_keep_ids": [],
     "exclude_spine_ids": [],
@@ -255,9 +257,9 @@ def main() -> None:
         Path(cache_path).mkdir(parents=True, exist_ok=True)
         translate_source = trim_spine(source, exclude_ids, trimmed)
 
-    # 2b. MASK math, then MASK code. Both replace content the LLM must never see
-    #     with inert placeholders, and both put the ORIGINAL bytes back after
-    #     translation (step 4).
+    # 2b. MASK math, then code, then tables. All three replace content the LLM
+    #     must never see with inert placeholders, and all three put the ORIGINAL
+    #     bytes back after translation (step 4).
     #       math  - epub_translator LaTeX-ifies <math> via mathml2latex: inline
     #               math comes back as unrenderable <m:math> and display math /
     #               matrices leak as literal `$$...$$` text.
@@ -265,18 +267,30 @@ def main() -> None:
     #               guarantee; a single chapter here has 1366 inline <code>
     #               elements, and one slip renames an identifier in the Chinese
     #               text or collapses the inline markup.
-    #     ORDER: mask math first, code second; restore in the REVERSE order
-    #     (LIFO, see step 4). The two placeholder alphabets are mutually inert
-    #     (a MATHPLACEHOLDER sentinel contains no <pre>/<code> markup, a code
-    #     placeholder contains no <math>), so masking could run either way
-    #     round; but whichever masker runs LAST captures the other's sentinels
-    #     inside its own mapping (a <math> inside a <pre> is already a math
-    #     sentinel when the <pre> is captured), and those sentinels only return
-    #     to the document when that mapping is restored — so the last masker
-    #     must be the first restorer.
-    #     Set `mask_math: false` / `mask_code: false` in the config to skip.
+    #       table - table/tr/td/th are NOT in the translator's inline-tag set, so
+    #               every cell is its own block and append-block appends a
+    #               translated cell after each original one: a 3-column header
+    #               comes back with 6 cells, the layout collapses in the reader,
+    #               and numeric / identifier columns are "translated" for nothing.
+    #               A table is therefore kept entirely in the source language;
+    #               its caption (`Table 3-1. …`) lives OUTSIDE the <table> and is
+    #               still translated like any other block.
+    #     ORDER: mask math -> code -> table; restore in the REVERSE order
+    #     (LIFO, see step 4). The three placeholder alphabets are mutually inert
+    #     (a MATHPLACEHOLDER/CODEPLACEHOLDER sentinel contains no markup at all,
+    #     an empty <pre data-codemask>/<table data-tablemask> contains no <math>),
+    #     so masking could run in any order; but whichever masker runs LAST
+    #     captures the earlier ones' placeholders inside its own mapping (a
+    #     <math> inside a <pre> is already a math sentinel when the <pre> is
+    #     captured; a <pre> inside a table cell is already a code placeholder
+    #     when the <table> is captured), and those placeholders only return to
+    #     the document when that mapping is restored — so the last masker must be
+    #     the first restorer.
+    #     Set `mask_math: false` / `mask_code: false` / `mask_table: false` in
+    #     the config to skip any of them.
     math_mapping: dict[int, str] = {}
     code_mapping: dict[int, str] = {}
+    table_mapping: dict[int, str] = {}
     if cfg.get("mask_math", True):
         Path(cache_path).mkdir(parents=True, exist_ok=True)
         masked = Path(cache_path) / f"{source.stem}.masked.epub"
@@ -295,10 +309,19 @@ def main() -> None:
             translate_source = masked
         else:
             code_mapping = {}
+    if cfg.get("mask_table", True):
+        Path(cache_path).mkdir(parents=True, exist_ok=True)
+        masked = Path(cache_path) / f"{source.stem}.masked-table.epub"
+        table_mapping, n_masked = mask_table_mod.mask_epub(translate_source, masked)
+        print(f"table: masked {n_masked} <table> element(s) before translation")
+        if n_masked:
+            translate_source = masked
+        else:
+            table_mapping = {}
 
     # translate into a temp file when anything has to be restored into `output`
     translate_target = output
-    if math_mapping or code_mapping:
+    if math_mapping or code_mapping or table_mapping:
         translate_target = Path(cache_path) / f"{source.stem}.translated.epub"
 
     # 3. translate with a live progress bar
@@ -328,12 +351,18 @@ def main() -> None:
     bar.update(max(0.0, 100 - last))
     bar.close()
 
-    # 4. RESTORE, in the reverse order of masking (code first, then math — see
-    #    step 2b). Every placeholder is put back at EVERY occurrence: append-block
-    #    keeps the source block and appends its translation, so an inline
-    #    placeholder shows up at least twice and restoring only the first would
-    #    lose the code/formula from the translated half of the book.
+    # 4. RESTORE, in the reverse order of masking (table first, then code, then
+    #    math — see step 2b). Restoring a table puts back markup that may still
+    #    hold code and math placeholders, and restoring a <pre> puts back markup
+    #    that may still hold math sentinels; going the other way round would
+    #    write those inner placeholders into the finished book verbatim.
+    #    Every placeholder is put back at EVERY occurrence: append-block keeps
+    #    the source block and appends its translation, so an inline placeholder
+    #    shows up at least twice and restoring only the first would lose the
+    #    code/formula from the translated half of the book.
     stages = []
+    if table_mapping:
+        stages.append(("table", mask_table_mod.restore_epub, table_mapping))
     if code_mapping:
         stages.append(("code", mask_code_mod.restore_epub, code_mapping))
     if math_mapping:
