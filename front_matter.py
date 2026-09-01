@@ -47,25 +47,32 @@ spine document is printed with the layer that decided it:
 
 Two hard safety rails on top of the layers:
 
-  * **Prefix only.** Apart from the tiny part-divider rule, a document is
-    excluded only if it sits *before* the body start — i.e. front matter is a
-    contiguous prefix of the spine. A chapter halfway through the book called
-    `the_cover_story.xhtml` is therefore untouchable, and "the body begins at
-    the first document we could not classify" is the fallback when the book
-    ships no landmarks at all.
+  * **Prefix only.** Apart from the tiny part-divider rule and the contents
+    page (see below), a document is excluded only if it sits *before* the body
+    start — i.e. front matter is a contiguous prefix of the spine. A chapter
+    halfway through the book called `the_cover_story.xhtml` is therefore
+    untouchable, and "the body begins at the first document we could not
+    classify" is the fallback when the book ships no landmarks at all.
   * **Generic `frontmatter` never excludes on its own.** Publishers routinely
     tag *everything* before chapter one with `epub:type="frontmatter"` — in
     "Reentry" that includes a 7,000-word narrative Prologue. Only specific
     categories (cover, titlepage, copyright, dedication, toc, preface, ...)
     count, and a large unclassified document before the body start is kept.
 
-And one claim is checked against the document instead of believed: "this is the
-table of contents" only stands if the document reads like one, i.e. most of its
-text sits inside links (measured across these books: a real ToC scores 0.90-1.00,
-prose scores 0.00-0.16). "Reentry" ships `<reference type="toc"
-href="Prologue.xhtml"/>` — its narrative Prologue — and that one bad attribute
-would otherwise both skip the Prologue *and*, by contradicting the landmarks,
-poison the body-start detection.
+The contents page: never translated, wherever it sits
+-----------------------------------------------------
+A table of contents is a list of the chapter titles, which the translated book
+re-renders from the chapters themselves; translating it is pure waste. So it is
+the one category excluded *regardless of position* — it does not have to sit in
+the front-matter prefix, and a book that buries its contents page behind the
+declared body start still gets it skipped.
+
+That makes the "is this really a ToC?" test the load-bearing part, because the
+claim is checked against the document instead of believed. "Reentry" ships
+`<reference type="toc" href="Prologue.xhtml"/>` — its 7,000-word narrative
+Prologue — and that one bad attribute would otherwise both skip the Prologue
+*and*, by contradicting the landmarks, poison the body-start detection. The
+test is "short *and* link-dense": see TOC_MAX_TEXT / TOC_MIN_LINK_RATIO.
 
 Run it standalone to audit a book without translating anything:
 
@@ -155,6 +162,24 @@ ABBREV_PATTERNS: list[tuple[str, str]] = [
 # Document types that must never be treated as front matter, whatever else says.
 BODY_EPUB_TYPES = {"bodymatter", "chapter", "prologue", "introduction", "epilogue"}
 
+# DPUB-ARIA spells the same vocabulary with a `doc-` prefix (`role="doc-toc"`),
+# and shipped books mix the two spellings *within one book*: "Why We Remember"
+# tags its dedication `epub:type="dedication" role="doc-dedication"` but its
+# contents page only `role="doc-toc"`, so the contents page went unrecognised
+# while the dedication was caught. Both spellings are therefore folded into one
+# canonical form before any lookup.
+#
+# Safe by construction, because the prefix is a pure spelling difference and the
+# two vocabularies agree on meaning: every `doc-*` role that names body text
+# (`doc-chapter`, `doc-introduction`, `doc-prologue`, `doc-epilogue`) folds onto
+# a BODY_EPUB_TYPES entry, which makes the *keep* side stronger too; the
+# front-matter roles (`doc-toc`, `doc-cover`, `doc-colophon`, `doc-epigraph`,
+# `doc-foreword`, `doc-preface`, ...) fold onto the right FRONT_EPUB_TYPES
+# entry; and the rest (`doc-index`, `doc-glossary`, `doc-endnotes`,
+# `doc-bibliography`, `doc-appendix`, ...) fold onto names no table contains, so
+# they simply do not vote — exactly as their unprefixed spellings do not.
+_DOC_ROLE_PREFIX = "doc-"
+
 # A name-pattern match on a document longer than this many characters of text is
 # ignored (a real chapter can share a word with a front-matter filename).
 NAME_MAX_TEXT = 20_000
@@ -169,10 +194,36 @@ ABBREV_MAX_TEXT = 1_000
 # Generic epub:type="frontmatter" only counts for tiny card pages.
 FRONTMATTER_TINY_MAX_TEXT = 1_000
 # "This is the table of contents" is only believed for a document that actually
-# reads like one: at least this fraction of its text inside links. "Reentry"
-# ships `<reference type="toc" href="Prologue.xhtml"/>` — a 7,000-word narrative
-# chapter — and without this guard that Prologue would silently go untranslated.
-TOC_MIN_LINK_RATIO = 0.5
+# reads like one: **short and link-dense**. Both halves are needed, and neither
+# alone is enough — measured across the books in `input/`:
+#
+#   document                                    chars   link ratio
+#   Reentry, Contents (a real ToC)                425         0.96
+#   Why We Remember, contents page               1005         0.46
+#   Reentry, Prologue mislabelled `type="toc"`   7347         0.00
+#   Hands-On LLMs, preface                      15767         0.29
+#   Hands-On LLMs, chapters 1-3             39k...51k    0.47-0.58
+#   trade-book prose (endnotes, index, ...)   9k...108k   0.00-0.29
+#
+# The length cap is what keeps real prose out: O'Reilly's HTMLBook chapters are
+# so full of cross-references and code annotations that they score 0.47-0.58,
+# higher than a genuine ToC that pads its entries with descriptions. No prose
+# document measured comes anywhere near the cap.
+#
+# 6,000 chars: six times the largest genuine ToC seen (1,005), and still below
+# "Reentry"'s 7,347-char Prologue, so that book's bogus `<reference type="toc"
+# href="Prologue.xhtml"/>` is now rejected twice over (by length as well as by
+# link ratio) instead of once. Overshooting the cap means "translate it", the
+# harmless direction, so a monster ToC costs one wasted page, not a lost chapter.
+TOC_MAX_TEXT = 6_000
+# 0.30: comfortably under the 0.46 of the tightest real ToC measured (Penguin
+# Random House writes an unlinked one-line description under every chapter
+# title, which dilutes the ratio — the old flat 0.5 threshold missed it by 0.04
+# and the whole contents page got translated), and comfortably over the 0.23 of
+# the densest *short* non-ToC page seen (a 187-char "next reads" ad card). The
+# 0.29 preface and the 0.47-0.58 chapters above sit on the wrong side of this
+# line and are held out by TOC_MAX_TEXT alone — belt and braces, on purpose.
+TOC_MIN_LINK_RATIO = 0.30
 
 
 # ------------------------------------------------------------------- parsing
@@ -238,6 +289,17 @@ def _strip(html: str) -> str:
     return " ".join(txt.split())
 
 
+def _canon(t: str) -> str:
+    """`doc-toc` -> `toc`: fold the DPUB-ARIA spelling onto the epub:type one."""
+    return t[len(_DOC_ROLE_PREFIX):] if t.startswith(_DOC_ROLE_PREFIX) else t
+
+
+def _with_canon(types: set[str]) -> set[str]:
+    """The types as written *plus* their canonical spellings, so lookups match
+    either way while the audit line can still quote what the file actually says."""
+    return types | {_canon(t) for t in types}
+
+
 def _types_in_tag(tag: str) -> set[str]:
     out: set[str] = set()
     for attr in ("epub:type", "data-type", "role"):
@@ -266,7 +328,7 @@ def _structural_types(html: str) -> set[str]:
         seen += 1
         if seen >= 3:
             break
-    return types
+    return _with_canon(types)
 
 
 def _opf_path(zf: zipfile.ZipFile) -> str:
@@ -399,6 +461,56 @@ def _read_spine(src: Path) -> tuple[list[SpineDoc], list[tuple[str, str]], list[
     return docs, guide, landmarks, opf_name
 
 
+TOC_LABEL = "table of contents"
+
+
+def _reads_like_toc(doc: SpineDoc) -> bool:
+    """Does the document actually *look* like a contents page — short, and most
+    of its text inside links? See TOC_MAX_TEXT / TOC_MIN_LINK_RATIO for the
+    measurements behind the two numbers."""
+    return doc.text_len <= TOC_MAX_TEXT and doc.link_ratio >= TOC_MIN_LINK_RATIO
+
+
+def _toc_claim(
+    doc: SpineDoc,
+    guide_by_path: dict[str, str],
+    landmark_by_path: dict[str, str],
+) -> tuple[str, str] | None:
+    """Return (layer, reason) if some layer says `doc` is the contents page *and*
+    the document reads like one.
+
+    Split out from `_classify` because this is the one verdict that ignores
+    position: the contents page is skipped wherever it sits in the spine, so the
+    caller applies this to every document, not just to the front-matter prefix.
+    """
+    if doc.epub_types & BODY_EPUB_TYPES or not _reads_like_toc(doc):
+        return None
+
+    lm = landmark_by_path.get(doc.path)
+    if lm and FRONT_EPUB_TYPES.get(_canon(lm)) == TOC_LABEL:
+        return "landmarks", f'landmarks epub:type="{lm}" ({TOC_LABEL})'
+
+    gt = guide_by_path.get(doc.path)
+    if gt and FRONT_GUIDE_TYPES.get(gt) == TOC_LABEL:
+        return "guide", f'<guide> reference type="{gt}" ({TOC_LABEL})'
+
+    for t in sorted(doc.epub_types):
+        if FRONT_EPUB_TYPES.get(_canon(t)) == TOC_LABEL:
+            return "epub:type", f'epub:type="{t}" ({TOC_LABEL})'
+
+    if "nav" in doc.properties.split():
+        return "manifest", 'manifest properties="nav" (navigation document)'
+
+    name = _name_tokens(doc)
+    for pattern, label in NAME_PATTERNS:
+        if label == TOC_LABEL and _name_match(name, pattern):
+            return (
+                "filename",
+                f"id/href matches /{pattern}/ ({TOC_LABEL}), {doc.text_len} chars",
+            )
+    return None
+
+
 def _classify(
     doc: SpineDoc,
     guide_by_path: dict[str, str],
@@ -410,19 +522,21 @@ def _classify(
 
     def _toc_ok(label: str) -> bool:
         """A "table of contents" claim has to survive looking at the document."""
-        return label != "table of contents" or doc.link_ratio >= TOC_MIN_LINK_RATIO
+        return label != TOC_LABEL or _reads_like_toc(doc)
 
     lm = landmark_by_path.get(doc.path)
-    if lm and lm in FRONT_EPUB_TYPES and _toc_ok(FRONT_EPUB_TYPES[lm]):
-        return "landmarks", f'landmarks epub:type="{lm}" ({FRONT_EPUB_TYPES[lm]})'
+    lmc = _canon(lm) if lm else None
+    if lmc and lmc in FRONT_EPUB_TYPES and _toc_ok(FRONT_EPUB_TYPES[lmc]):
+        return "landmarks", f'landmarks epub:type="{lm}" ({FRONT_EPUB_TYPES[lmc]})'
 
     gt = guide_by_path.get(doc.path)
     if gt and gt in FRONT_GUIDE_TYPES and _toc_ok(FRONT_GUIDE_TYPES[gt]):
         return "guide", f'<guide> reference type="{gt}" ({FRONT_GUIDE_TYPES[gt]})'
 
     for t in sorted(doc.epub_types):
-        if t in FRONT_EPUB_TYPES and _toc_ok(FRONT_EPUB_TYPES[t]):
-            return "epub:type", f'epub:type="{t}" ({FRONT_EPUB_TYPES[t]})'
+        tc = _canon(t)
+        if tc in FRONT_EPUB_TYPES and _toc_ok(FRONT_EPUB_TYPES[tc]):
+            return "epub:type", f'epub:type="{t}" ({FRONT_EPUB_TYPES[tc]})'
 
     if lm == "bodymatter":
         # Declared body. The weak layers below (filename, size) may not override
@@ -556,7 +670,16 @@ def analyze(src: Path) -> Report:
     decisions: list[Decision] = []
     for d in docs:
         layer, reason, excluded = "", "", False
-        if d.index < body_index:
+        toc = _toc_claim(d, guide_by_path, landmark_by_path)
+        if toc:
+            # Position-independent: a contents page is never translated, whether
+            # it sits in the front-matter prefix, behind the declared body start
+            # (Calibre and Penguin Random House both ship "inline" contents
+            # pages there), or anywhere else in the spine.
+            layer, reason = toc
+            reason = "contents page (never translated): " + reason
+            excluded = True
+        elif d.index < body_index:
             if d.index in classified:
                 layer, reason = classified[d.index]
                 excluded = True

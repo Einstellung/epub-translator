@@ -206,12 +206,19 @@ user_prompt: |            # appended to the system prompt — domain/style hints
 翻译从正文第一章开始。封面、赞誉/题献页、书名页、版权页、目录、前言，以及只有一行标题的
 Part 分隔页，`front_matter.py` 会自动识别并跳过——它们照旧原样留在成品的阅读顺序里，只是不译。
 
-识别分层，从权威到启发式：nav `landmarks` → OPF `<guide>` → 文档自己的 `epub:type` →
-spine id/文件名 → 体量。"正文从哪开始"的指针（`landmarks bodymatter`、`guide type="text"`）
-只在它没指向一个本身就是前置页面的文档时才采信——实测 O'Reilly 把 `type="text"` 指到书名页、
-企鹅兰登把 `bodymatter` 指到题献页，照单全收就会漏排一半前置页。安全上宁可漏排不可错排：
-泛泛的 `epub:type="frontmatter"` 单独不足以排除（Reentry 的 7000 字 Prologue 就挂着这个标），
+识别分层，从权威到启发式：nav `landmarks` → OPF `<guide>` → 文档自己的 `epub:type`
+（`epub:type="toc"` 和 DPUB-ARIA 的 `role="doc-toc"` 一视同仁）→ spine id/文件名 → 体量。
+"正文从哪开始"的指针（`landmarks bodymatter`、`guide type="text"`）只在它没指向一个本身就是
+前置页面的文档时才采信——实测 O'Reilly 把 `type="text"` 指到书名页、企鹅兰登把 `bodymatter`
+指到题献页，照单全收就会漏排一半前置页。安全上宁可漏排不可错排：泛泛的
+`epub:type="frontmatter"` 单独不足以排除（Reentry 的 7000 字 Prologue 就挂着这个标），
 文件名匹配对长文档不生效，前置页面只能是 spine 的连续前缀。
+
+**目录页一律不翻译**，且不受"连续前缀"的限制：无论它排在 spine 的哪个位置（Calibre 和企鹅兰登
+都会把 inline 目录塞在正文起点之后），只要判定为目录就跳过。判定不看别人怎么标，只看文档本身
+像不像目录——**短**（≤ 6000 字符）**且链接密集**（链接文字占比 ≥ 0.30）。两个条件缺一不可：
+Reentry 的 OPF 把 `<reference type="toc">` 指到了 7000 字的叙事 Prologue，O'Reilly 的正文章节
+因为交叉引用多，链接占比高达 0.47–0.58，只靠其中一个条件就会把正文当目录扔掉。
 
 每本书跑之前都会把 9 行/26 行的判定表打印出来（每个文档：排还是留、依据哪一层），误判一眼可见。
 误判时用 `front_matter_keep_ids: [该文档的 spine id]` 强制翻译它，或 `skip_front_matter: false`
