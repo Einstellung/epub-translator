@@ -144,20 +144,56 @@ NAME_PATTERNS: list[tuple[str, str]] = [
     (r"series[-_]?page|about[-_]?the[-_]?series|ad[-_]?card|bookad", "series / ad page"),
     (r"toc|contents|tableofcontents|table[-_]?of[-_]?contents", "table of contents"),
     (r"preface|foreword|prf|pref|frontmatter|front[-_]?matter", "preface / foreword"),
+    # "acknowledgments" is already a FRONT_EPUB_TYPES category, but no pattern
+    # here matched it, so a book that ships no epub:type at all (Manning's
+    # retail EPUBs) ended its front-matter prefix on the acknowledgments page
+    # and translated everything after it. Trade books put acknowledgments in the
+    # *back* — measured at spine #17-#23 in Reentry, Why We Remember, The
+    # Experience Machine and The President's Book of Secrets — and the
+    # prefix-only rail is what keeps those untouched.
+    (r"acknowledge?ments?", "acknowledgments"),
 ]
 
-# Publisher shorthand (Penguin Random House & friends name files `..._cvi_r1`,
-# `_tp_`, `_cop_`, `_ded_`, `_epi_`). These abbreviations are too short to be
-# safe on their own — `epi` is equally "epigraph" and "epilogue" — so they only
-# apply to documents small enough that no prose could be hiding in them.
+# Names that are only safe on a *tiny* page. Two kinds live here:
+#
+#   * publisher shorthand — Penguin Random House & friends name files
+#     `..._cvi_r1`, `_tp_`, `_cop_`, `_ded_`, `_epi_`; these abbreviations are
+#     too short to be unambiguous (`epi` is equally "epigraph" and "epilogue");
+#   * plain English words that are *also* ordinary vocabulary — `title`.
+#
+# Both would be reckless in NAME_PATTERNS, which allows up to NAME_MAX_TEXT
+# (20,000) characters. Here they only apply to documents small enough
+# (ABBREV_MAX_TEXT, 1,000 chars) that no prose could be hiding in them.
+#
+# Bare `title`: Manning's retail EPUBs call the title page `title.xhtml`
+# (measured in "Build a Reasoning Model": 220 chars) while NAME_PATTERNS only
+# knows `titlepage` / `title_page` / `halftitle`. That book carries no
+# epub:type, no role, no nav document and therefore no landmarks, and a
+# `<guide>` with a single `type="cover"` entry — L1/L2/L3 are all silent, so the
+# filename is the only signal there is. Missing it did not cost one page: the
+# prefix scan stopped dead at #1 and let the copyright page, dedication,
+# contents, preface and everything else through. `title` is not in
+# NAME_PATTERNS because a real chapter can easily contain the word ("The Title
+# Fight"); at 1,000 chars it cannot.
 ABBREV_PATTERNS: list[tuple[str, str]] = [
     (r"cvi|cvr|cov", "cover"),
-    (r"tp|htp|hftp|tpg", "title page"),
+    (r"tp|htp|hftp|tpg|title", "title page"),
     (r"cop|copy|cpr", "copyright page"),
     (r"ded", "dedication"),
     (r"epi|epg", "epigraph"),
     (r"con|cnt", "table of contents"),
 ]
+
+# Reference apparatus: an index, glossary or bibliography is *naturally*
+# link-dense — measured 0.29-0.86 across this corpus, i.e. right in genuine-ToC
+# territory — so "short and link-dense" cannot tell one from a contents page.
+# A layer that calls one of these the table of contents is therefore not
+# believed, at any length.
+#
+# The veto only ever moves a document from SKIP to keep, so over-matching it is
+# the harmless direction; that is why the name half can afford to be broad.
+REFERENCE_APPARATUS_TYPES = {"index", "glossary", "bibliography"}
+REFERENCE_APPARATUS_NAMES = r"index|idx|glossary|bibliography|biblio"
 
 # Document types that must never be treated as front matter, whatever else says.
 BODY_EPUB_TYPES = {"bodymatter", "chapter", "prologue", "introduction", "epilogue"}
@@ -189,40 +225,65 @@ UNCLASSIFIED_MAX_TEXT = 20_000
 # A "Part I" divider page is a heading and nothing else.
 PART_DIVIDER_MAX_TEXT = 600
 PART_DIVIDER_MAX_BODY_TEXT = 200  # text left after removing the headings
-# Publisher shorthand (ABBREV_PATTERNS) only counts for pages this small.
+# Ambiguous short names (ABBREV_PATTERNS) only count for pages this small.
 ABBREV_MAX_TEXT = 1_000
 # Generic epub:type="frontmatter" only counts for tiny card pages.
 FRONTMATTER_TINY_MAX_TEXT = 1_000
 # "This is the table of contents" is only believed for a document that actually
-# reads like one: **short and link-dense**. Both halves are needed, and neither
-# alone is enough — measured across the books in `input/`:
+# reads like one: **short and link-dense**. Re-measured over every EPUB on this
+# machine (17 files, 305 spine documents, `input/` and `output/`) *after* the
+# self-closing-anchor bug in _LINK_RE was fixed — the numbers below are the
+# corrected ones, and they look nothing like the numbers this comment used to
+# quote, because that bug was inflating every prose document's link ratio.
 #
-#   document                                    chars   link ratio
-#   Reentry, Contents (a real ToC)                425         0.96
-#   Why We Remember, contents page               1005         0.46
-#   Reentry, Prologue mislabelled `type="toc"`   7347         0.00
-#   Hands-On LLMs, preface                      15767         0.29
-#   Hands-On LLMs, chapters 1-3             39k...51k    0.47-0.58
-#   trade-book prose (endnotes, index, ...)   9k...108k   0.00-0.29
+# Only documents some layer actually *claims* are a ToC are ever measured, so
+# these are the samples that matter:
 #
-# The length cap is what keeps real prose out: O'Reilly's HTMLBook chapters are
-# so full of cross-references and code annotations that they score 0.47-0.58,
-# higher than a genuine ToC that pads its entries with descriptions. No prose
-# document measured comes anywhere near the cap.
+#   claimed as ToC                                     chars   link ratio
+#   Reentry, Contents (genuine)                          425         0.96
+#   Presidents Book of Secrets, Contents (genuine)       527         0.92
+#   The Experience Machine, toc (genuine)                691         0.90
+#   Why We Remember, inlinetoc (genuine)                1005         0.46
+#   Build a Reasoning Model, contents (genuine)         7160         1.00
+#   Active Inference, Contents, bilingual (genuine)    13404         1.00
+#   Reentry, Prologue mislabelled `type="toc"`          7347         0.00
+#   Reentry, ditto in the bilingual output             10008         0.00
 #
-# 6,000 chars: six times the largest genuine ToC seen (1,005), and still below
-# "Reentry"'s 7,347-char Prologue, so that book's bogus `<reference type="toc"
-# href="Prologue.xhtml"/>` is now rejected twice over (by length as well as by
-# link ratio) instead of once. Overshooting the cap means "translate it", the
-# harmless direction, so a monster ToC costs one wasted page, not a lost chapter.
-TOC_MAX_TEXT = 6_000
+# and, as the upper guard, the densest documents in the corpus that are *not*
+# contents pages:
+#
+#   not a ToC                                          chars   link ratio
+#   Build a Reasoning Model, index                     16394         0.86
+#   Presidents Book of Secrets, endnotes 2             67267         0.37
+#   Presidents Book of Secrets, index                  43066         0.33
+#   Presidents Book of Secrets, endnotes 1             59064         0.31
+#   Why We Remember, index                             22254         0.29
+#   every real chapter / preface measured           15k...111k   0.00-0.05
+#
+# The link ratio, not the length cap, is what keeps prose out: with anchors
+# counted correctly, real prose scores 0.00-0.05 and both mislabelled
+# "Reentry" Prologues score 0.00 — three hundred times below the 0.30 line.
+# (The old comment credited the length cap for this, on the strength of
+# chapters that "scored 0.47-0.58"; those scores were the anchor bug.)
+#
+# 20,000 chars: 1.5x the largest genuine ToC measured (13,404 — the bilingual
+# Active Inference contents page; its English source was ~6,700, and the 6,000
+# cap that used to sit here is precisely why it got translated), and less than
+# half the smallest non-ToC document in the corpus that clears the ratio bar at
+# all (the 43,066-char Presidents index, 0.33). It is also exactly
+# NAME_MAX_TEXT, which keeps this rule from ever being more permissive than the
+# ordinary filename layer it rides on. Both "Reentry" counterexamples are still
+# rejected — on link ratio, which is the test that was doing the work all along.
+# Overshooting the cap means "translate it", the harmless direction, so a
+# monster ToC costs one wasted page, not a lost chapter.
+TOC_MAX_TEXT = 20_000
 # 0.30: comfortably under the 0.46 of the tightest real ToC measured (Penguin
 # Random House writes an unlinked one-line description under every chapter
 # title, which dilutes the ratio — the old flat 0.5 threshold missed it by 0.04
 # and the whole contents page got translated), and comfortably over the 0.23 of
-# the densest *short* non-ToC page seen (a 187-char "next reads" ad card). The
-# 0.29 preface and the 0.47-0.58 chapters above sit on the wrong side of this
-# line and are held out by TOC_MAX_TEXT alone — belt and braces, on purpose.
+# the densest *short* non-ToC page seen (a 187-char "next reads" ad card). With
+# anchors measured correctly this is now the load-bearing half of the test: the
+# nearest prose above the line is a 43k-char index, held out by TOC_MAX_TEXT.
 TOC_MIN_LINK_RATIO = 0.30
 
 
@@ -276,7 +337,15 @@ class Report:
 _TAG_RE = re.compile(r"<[^>]+>")
 _SCRIPT_RE = re.compile(r"<(script|style)\b.*?</\1\s*>", re.S | re.I)
 _HEADING_RE = re.compile(r"<h[1-6]\b.*?</h[1-6]\s*>", re.S | re.I)
-_LINK_RE = re.compile(r"<a\b[^>]*>.*?</a\s*>", re.S | re.I)
+# `(?![^>]*/>)` skips *self-closing* anchors. `<a id="ch1en1"/>` is how several
+# publishers plant endnote back-references, and matching one made the lazy
+# `.*?</a>` run on to the next real `</a>` — swallowing whole paragraphs of
+# prose as "link text". Measured: it pushed "The President's Book of Secrets"
+# chapter 1 (29k chars of narrative, 5 anchors of which 2 self-closing) to a
+# link ratio of 0.92, i.e. more ToC-like than a genuine contents page. Since
+# link density is the test that keeps prose from being skipped as a ToC, an
+# error in this direction is the dangerous one.
+_LINK_RE = re.compile(r"<a\b(?![^>]*/>)[^>]*>.*?</a\s*>", re.S | re.I)
 _VOID_OR_INLINE = {
     "br", "img", "hr", "a", "span", "link", "meta", "em", "i", "b", "strong",
     "sup", "sub", "small", "wbr", "svg", "image",
@@ -471,6 +540,27 @@ def _reads_like_toc(doc: SpineDoc) -> bool:
     return doc.text_len <= TOC_MAX_TEXT and doc.link_ratio >= TOC_MIN_LINK_RATIO
 
 
+def _reference_apparatus(doc: SpineDoc) -> str | None:
+    """Is this an index / glossary / bibliography? Returns why, for the audit
+    line. See REFERENCE_APPARATUS_TYPES for what this guards against.
+
+    `_name_match` is whole-word, so `indexing.xhtml` does not trip it; a chapter
+    genuinely called "Index of Notation" does, and is then *kept* — the harmless
+    direction, which is why the name list does not need to be careful.
+    """
+    hit = doc.epub_types & REFERENCE_APPARATUS_TYPES
+    if hit:
+        return f'epub:type="{sorted(hit)[0]}"'
+    if _name_match(_name_tokens(doc), REFERENCE_APPARATUS_NAMES):
+        return f"id/href matches /{REFERENCE_APPARATUS_NAMES}/"
+    return None
+
+
+def _believable_toc(doc: SpineDoc) -> bool:
+    """Reads like a contents page *and* is not reference apparatus."""
+    return _reads_like_toc(doc) and _reference_apparatus(doc) is None
+
+
 def _toc_claim(
     doc: SpineDoc,
     guide_by_path: dict[str, str],
@@ -483,9 +573,19 @@ def _toc_claim(
     position: the contents page is skipped wherever it sits in the spine, so the
     caller applies this to every document, not just to the front-matter prefix.
     """
-    if doc.epub_types & BODY_EPUB_TYPES or not _reads_like_toc(doc):
+    if doc.epub_types & BODY_EPUB_TYPES or not _believable_toc(doc):
         return None
+    return _toc_claim_source(doc, guide_by_path, landmark_by_path)
 
+
+def _toc_claim_source(
+    doc: SpineDoc,
+    guide_by_path: dict[str, str],
+    landmark_by_path: dict[str, str],
+) -> tuple[str, str] | None:
+    """Which layer, if any, says `doc` is the contents page — without checking
+    whether the claim survives looking at the document. Split out so the veto in
+    `_toc_veto_note` can name the claim it is refusing."""
     lm = landmark_by_path.get(doc.path)
     if lm and FRONT_EPUB_TYPES.get(_canon(lm)) == TOC_LABEL:
         return "landmarks", f'landmarks epub:type="{lm}" ({TOC_LABEL})'
@@ -511,6 +611,23 @@ def _toc_claim(
     return None
 
 
+def _toc_veto_note(
+    doc: SpineDoc,
+    guide_by_path: dict[str, str],
+    landmark_by_path: dict[str, str],
+) -> str | None:
+    """never silent: a document that *would* have been skipped as the contents
+    page, and was not because it is an index / glossary / bibliography, says so
+    on its own audit line rather than quietly becoming "body"."""
+    apparatus = _reference_apparatus(doc)
+    if not apparatus or doc.epub_types & BODY_EPUB_TYPES or not _reads_like_toc(doc):
+        return None
+    src = _toc_claim_source(doc, guide_by_path, landmark_by_path)
+    if not src:
+        return None
+    return f"{src[1]} NOT BELIEVED, reference apparatus: {apparatus}"
+
+
 def _classify(
     doc: SpineDoc,
     guide_by_path: dict[str, str],
@@ -522,7 +639,7 @@ def _classify(
 
     def _toc_ok(label: str) -> bool:
         """A "table of contents" claim has to survive looking at the document."""
-        return label != TOC_LABEL or _reads_like_toc(doc)
+        return label != TOC_LABEL or _believable_toc(doc)
 
     lm = landmark_by_path.get(doc.path)
     lmc = _canon(lm) if lm else None
@@ -557,7 +674,7 @@ def _classify(
             if _name_match(name, pattern) and _toc_ok(label):
                 return (
                     "filename",
-                    f"id/href matches publisher shorthand /{pattern}/ ({label}), "
+                    f"id/href matches short-page name /{pattern}/ ({label}), "
                     f"only {doc.text_len} chars",
                 )
 
@@ -703,6 +820,10 @@ def analyze(src: Path) -> Report:
                 reason = "body starts here"
             else:
                 reason = "body"
+        if not excluded:
+            note = _toc_veto_note(d, guide_by_path, landmark_by_path)
+            if note:
+                reason = f"{reason} [{note}]"
         decisions.append(Decision(doc=d, excluded=excluded, layer=layer, reason=reason))
 
     return Report(decisions, body_index, body_layer, body_reason)
