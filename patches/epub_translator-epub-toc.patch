@@ -1,0 +1,32 @@
+--- a/epub_translator/epub/toc.py
++++ b/epub_translator/epub/toc.py
+@@ -58,10 +58,23 @@
+     with zip.read(toc_path) as f:
+         xml_node = XMLLikeNode(f, is_html_like=False)
+ 
+-    if version == 3:
+-        toc_list = _read_nav_toc(xml_node.element)
+-    else:
+-        toc_list = _read_ncx_toc(xml_node.element)
++    # Never translate the navigation TOC - the reader's outline stays in the source
++    # language.
++    #
++    # This module is a translation channel of its own - read_toc() -> LLM ->
++    # write_toc() - entirely separate from the spine walk in translation/translator.py,
++    # and it handled exactly one file per book: the nav document for EPUB3, the NCX for
++    # EPUB2 (see _find_toc_path). So an EPUB3 book came back with every outline entry
++    # doubled up ("Chapter One: Before the Book 第一章：书成之前") while its toc.ncx
++    # stayed clean English.
++    #
++    # It cannot be stopped from the outside: the nav document lives only in the OPF
++    # manifest (properties="nav") and never in the spine, so neither front_matter.py nor
++    # exclude_spine_ids can see it, and the library exposes no switch.
++    #
++    # An empty list closes the whole channel at its source: translate() then gives the
++    # TOC no progress weight, emits no TOC task (so no tokens are spent on it) and never
++    # calls write_toc, leaving nav and NCX to be copied through byte for byte - still
++    # present, still linked, just not translated.
++    toc_list: list[Toc] = []
+ 
+     context = TocContext(version=version, toc_path=toc_path, xml_node=xml_node)
+     return toc_list, context

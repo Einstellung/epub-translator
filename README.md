@@ -25,8 +25,9 @@ uv run python apply_patches.py
 
 ### Local dependency patches
 
-`epub-translator` ships two bugs that are fatal for a book-length run, fixed here in
-`patches/*.patch` rather than upstream:
+`epub-translator` ships two bugs that are fatal for a book-length run, plus one
+behaviour this project does not want; all three are fixed in `patches/*.patch` rather
+than upstream:
 
 * **`<|endoftext|>` kills the process.** A book *about* language models quotes
   `<|endoftext|>`, `<|fim_prefix|>` and friends as ordinary prose. `tiktoken` refuses to
@@ -41,8 +42,27 @@ uv run python apply_patches.py
   keeps the 520–527 Cloudflare range). 402 "insufficient balance" and the 4xx credential
   errors still fail on the first response — retrying those only delays the error you
   have to act on.
+* **The reader's outline came back bilingual.** Every entry in the sidebar TOC turned
+  into source-plus-translation crammed onto one line — `Cover 封面`, `Chapter One:
+  Before the Book 第一章：书成之前` — which is unreadable at sidebar width and is not
+  what a bilingual build is for. Suspiciously, `toc.ncx` of the same book stayed clean
+  English: `epub/toc.py` is a translation channel of its own (`read_toc()` → LLM →
+  `write_toc()`), separate from the spine walk, and `_find_toc_path()` picks *exactly
+  one* file per book — the nav document for EPUB3, the NCX for EPUB2. So an EPUB3 book
+  gets its nav translated and its NCX left alone, and an EPUB2 book the reverse.
+  This one cannot be fixed in our own code: the nav document lives only in the OPF
+  manifest as `properties="nav"` and is not in the spine, so `front_matter.py` and
+  `exclude_spine_ids` — which both walk the spine — never see it, and the library
+  exposes no switch. The patch makes `read_toc()` return an empty TOC list, which closes
+  the channel at its source: `translate()` then gives the TOC no progress weight, emits
+  no TOC task (no tokens spent on it) and never calls `write_toc`. Nav and NCX are
+  copied through byte for byte — still in the manifest, still `properties="nav"`, every
+  link still resolving, just not translated. Verified end to end on both branches: an
+  EPUB3 slice (nav + NCX) and an EPUB2 slice (NCX only), each with the two TOC files
+  SHA-identical to the source, zero dangling TOC links, and the chapter text translated
+  as usual.
 
-`uv sync` restores the pristine wheel and silently drops both fixes, so run this after
+`uv sync` restores the pristine wheel and silently drops all three, so run this after
 every sync:
 
 ```bash
