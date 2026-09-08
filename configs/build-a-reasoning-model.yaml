@@ -1,0 +1,155 @@
+# configs/build-a-reasoning-model.yaml —《Build a Reasoning Model (From Scratch)》
+#   (Sebastian Raschka, Manning 2026) 全书双语翻译配置
+# 用法：  uv run python translate_book.py configs/build-a-reasoning-model.yaml
+# 模板见仓库根目录的 translate_book.yaml。API 凭据从 .env 读取。
+#
+# ── 这本书的特殊说明 ────────────────────────────────────
+# 1. 源文件是 Manning 的零售版 EPUB（出版终版，不是 PDF 转的），
+#    结构干净、无需 OCR，spine 26 个文档：
+#    前置页 10 个 / 正文第 1-8 章 / 附录 A-G / index。
+# 2. 全书 0 个 <math>：公式全部以行内 <code> 或图片形式排版。
+#    mask_math 照常开着，但对这本书完全空转，
+#    所以翻完【不需要】再跑 fix_epub_math.py——别照搬别的书的流程多跑一步。
+# 3. 代码密度是本仓库处理过的书里最高的一档：473 个 <pre> 代码清单 +
+#    1703 个行内 <code>。mask_code 必开，不能指望提示词约束住模型。
+# 4. 全书 180 张插图（png/jpg），Raschka 的示意图**文字是烧在图片像素里的**，
+#    图内的标签、箭头注释、流程框文字无法翻译，成品里这部分仍是英文。
+#    能译的只有图片外面的图注（`Figure 2.11 ...`）。这是这本书的固有限制。
+
+# ── 必填 ──────────────────────────────────────────────
+source: "input/Build a Reasoning Model.epub"
+output: "output/从零构建推理模型_中英对照.epub"
+
+# ── 翻译设置 ──────────────────────────────────────────
+language: zh
+submit: append-block    # 原文块后追加译文，保留原书代码清单与图注的位置
+concurrency: 16
+max_group_tokens: 2600
+
+# ── 术语表 ──────────────────────────────────────────────
+# 术语复用率极高（正文里 model 733 次、reasoning 351 次、GRPO 160 次、
+# rollout 92 次、distillation 91 次），全书统一译法对可读性影响很大，务必开启。
+glossary:
+  enabled: true
+  auto_generate: true
+  min_freq: 2          # 整本书体量，阈值 2
+
+# ── 代码、公式与表格不翻译 ──────────────────────────────
+# 三项都是「送进模型前换成哨兵、译完把原文原样放回」，模型根本看不到它们，
+# 成品里这些部分与源书逐字节相同。
+mask_code: true         # 必开：全书 473 个 <pre> + 1703 个行内 <code>
+mask_math: true         # 本书 <math> 数为 0，此项对它空转（保留是为了和模板一致）
+mask_table: true        # 15 个表格整体保持原文；表外的表题（`Table 3.1 …`）照常译
+
+# ── 前置页不翻译 ────────────────────────────────────────
+# 封面/书名页/版权页/题献/目录等自动识别并排除；被跳过的文档仍完整保留在成品里。
+# 注意：前置页走的是这条路径，不要把 copyright/contents/preface 之类的 id
+# 写进下面的 exclude_spine_ids。
+skip_front_matter: true
+front_matter_keep_ids: []
+
+# ── 排除章节（附录与索引不翻译）─────────────────────────
+# 用户要求：附录 A-G 与索引一律不翻译，只译正文第 1-8 章。
+# 被排除的文档**仍完整保留在成品里**（trim_spine 只是让翻译流程跳过它们，
+# restore_spine 会把 itemref 按原顺序插回去），读者照样能翻到，只是不带中文。
+exclude_spine_ids:
+  - appendix-a   # References and further reading（分章参考文献与延伸阅读）
+  - appendix-b   # Exercise solutions（习题答案）
+  - appendix-c   # Qwen3 LLM source code（Qwen3 模型源码：RMSNorm、前馈模块等）
+  - appendix-d   # Using larger LLMs（换用更大的 Qwen3 配置与检查点下载）
+  - appendix-e   # Batching and throughput-oriented execution（批处理与吞吐优化）
+  - appendix-f   # Common approaches to model evaluation（常见模型评测方法）
+  - appendix-g   # Building a chat interface（用 Chainlit 搭聊天界面）
+  - index        # 索引
+  # 以下两页是本书专属的决定，不是通用规则：它们排在正文起点 about-this-book
+  # 之后，前置页识别的前缀栏够不到，只能在这里显式列出。
+  # about-this-book 本身【要翻译】——它讲这本书怎么读、代码环境怎么配，对读者有用。
+  - about-the-author              # About the author（作者简介）
+  - about-the-cover-illustration  # About the cover illustration（封面插画说明）
+
+# ── 缓存（断点续传）────────────────────────────────────
+cache_path: ""          # 留空自动用 .cache/<书名>
+
+# ── 翻译风格 ────────────────────────────────────────────
+user_prompt: |
+  这是 Sebastian Raschka 的技术书《Build a Reasoning Model (From Scratch)》
+  （Manning 出版），「从零手写」系列的一本。内容是：从一个预训练的小型开源 LLM
+  （Qwen3）出发，用纯 PyTorch 一步步手工实现推理模型的各项核心技术——文本生成、
+  推理模型评测、推理时扩展、自我改进、强化学习训练（RLVR / GRPO）与蒸馏。
+  读者是已经会 Python、有一定深度学习基础的工程师。
+
+  【术语统一】采用中文技术社区的通行译法；首次出现用「中文（English）」，
+  之后统一用中文。以下按全书正文词频从高到低挑出，务必前后一致：
+
+  - 核心概念：推理模型(reasoning model，351 次)、推理(reasoning)、
+    思维链(chain-of-thought / CoT)、推理轨迹(reasoning trace)、
+    中间推理步骤(intermediate reasoning steps)、最终答案(final answer)、
+    推理时扩展(inference-time scaling)、自洽性采样(self-consistency sampling)、
+    多数投票(majority voting)、自我改进/自我修正(self-refinement，59 次)、
+    验证器(verifier，40 次)、验证(verification)、
+    常规大模型(conventional LLM)、基础模型(base model)。
+
+  - 文本生成与采样：文本生成(text generation)、
+    自回归(autoregressive)、下一个词元(next token)、词元(token)、
+    词元 ID(token IDs)、分词器(tokenizer，72 次)、词表(vocabulary)、
+    对数概率(log probabilities，注意书里大量写作 logprob，见下)、
+    概率分布(probability distribution)、概率分数(probability scores)、
+    温度(temperature，104 次)、温度缩放(temperature scaling)、
+    采样(sampling)、top-p 采样、贪心解码(greedy decoding)、
+    KV 缓存(KV cache)、上下文(context)、权重(weights)、
+    归一化(normalization)。
+
+  - 强化学习：强化学习(reinforcement learning, RL)、
+    基于人类反馈的强化学习(RLHF)、可验证奖励强化学习(RLVR，52 次)、
+    策略(policy)、策略梯度损失(policy gradient loss)、
+    策略比值(policy ratio)、裁剪(clipping) / 裁剪后的策略比值(clipped policy ratio)、
+    优势(advantage，81 次)、奖励(reward)、平均奖励(average reward)、
+    格式奖励(format reward)、可验证奖励(verifiable rewards)、
+    奖励模型(reward model)、参考模型(reference model)、
+    熵(entropy，77 次)、KL 散度(KL divergence)、
+    序列级(sequence-level) / 词元级(token-level)、
+    训练循环(training loop)、一次训练运行(training run)、
+    响应长度(response length)。
+
+  - 蒸馏与微调：蒸馏(distillation，91 次)、
+    教师模型(teacher model)、学生模型(student model)、
+    监督微调(supervised fine-tuning, SFT)、微调(fine-tuning)、
+    预训练(pretraining) / 预训练模型(pretrained model)、
+    偏好微调(preference tuning)、检查点(checkpoint)。
+
+  - 评测与训练工程：评测(evaluation)、评测基准(benchmark)、
+    准确率(accuracy)、答案准确率(answer accuracy)、
+    数据集(dataset)、测试集(test set)、验证集(validation set)、
+    验证损失(validation loss)、损失(loss)、损失项(loss term)、
+    梯度(gradient)、优化器(optimizer)、批次(batch)、轮次(epoch)、
+    学习率(learning rate)、吞吐量(throughput)、标准差(standard deviation)。
+
+  - 以下几个直接保留英文原词，不要生造中文译名；首次出现可加一次中文括注，
+    之后一律用原词：GRPO、PPO、RLVR、RLHF、SFT、rollout（一轮完整的采样生成）、
+    logits、logprob / logprobs、softmax、top-p、KL、CoT。
+
+  【一律保留英文，不要翻译】
+  - 库与工具名：PyTorch、Hugging Face、CUDA、Matplotlib、torch.compile，
+    以及本书配套的包名 reasoning_from_scratch 和仓库名 reasoning-from-scratch。
+  - 模型与数据集名：Qwen3、Llama、DeepSeek、DeepSeek-R1、GPT、ChatGPT、o1、
+    MATH-500、GSM8K 等。
+  - 一切代码标识符：函数名、类名、方法名、参数名、变量名、文件名、目录名、
+    命令、包名、环境变量、特殊标记（如 <think>、\boxed{}）。
+  - URL、arXiv 编号、GitHub 路径原样保留。
+
+  【占位符】形如 CODEPLACEHOLDER00001X / MATHPLACEHOLDER0001X 的记号是
+  代码块与公式的替身，必须原样逐字保留：不得翻译、改写、拆分、增删任何字符，
+  也不得改变大小写或前后空格。
+
+  【编号】图注、代码清单、表格的编号一律保留原样（Figure 2.11、Listing 3.2、
+  Table 3.1 之类），只翻译后面的说明文字。正文里的交叉引用同理：
+  「see chapter 4」译成「见第 4 章」、「figure 5.3」译成「图 5.3」，编号不动。
+  另：书中插图的文字烧在图片里、无法翻译，图注是读者理解图的唯一中文入口，
+  所以图注要译得完整、具体，不要偷懒缩写。
+
+  【文风】Raschka 写得平实、循序渐进，大量用第二人称（you/we）直接对读者说话，
+  句子短、少用被动、常有「接下来我们…」这类过渡。中文照这个调子来：
+  用「我们」「你」自然承接，写成中文技术写作的口吻，长句拆开，
+  避免翻译腔，更不要写成学术论文腔或堆砌书面语。
+
+  不要 summarize、不要省略、不要添加译者注或任何解释性文字。
