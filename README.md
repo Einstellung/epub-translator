@@ -203,7 +203,15 @@ Keep one config file per book under `configs/` and load the one you want:
 cp translate_book.yaml configs/my-book.yaml      # one-time per book
 # edit configs/my-book.yaml to point at your EPUB
 uv run python translate_book.py configs/my-book.yaml
+uv run python polish_cjk.py output/my-book.zh-bilingual.epub out.epub   # see below
 ```
+
+**For a Chinese target, `translate_book.py` is not the last step.** Publisher
+stylesheets set a Latin-only `font-family` (Verdana, Arial), so every Han
+character falls back to whatever font the reading app happens to pick — the
+translation renders lighter and larger than the surrounding English, at a line
+height meant for Latin. Run `polish_cjk.py` afterwards; see
+[CJK typography pass](#cjk-typography-pass-polish_cjkpy).
 
 Running `translate_book.py` with no argument falls back to the root template.
 A book config points at the source EPUB and tunes glossary/exclusions/style:
@@ -394,3 +402,124 @@ reference book through all three maskers without an LLM (844 `<pre>`/`<code>`
 elements + 4 `<table>`s) reproduces every source XHTML document byte-identically.
 
 
+
+## CJK typography pass (`polish_cjk.py`)
+
+Retail EPUBs set `font-family` for **Latin** text — Manning's reasoning-model
+book, for instance, has `#sbo-rt-content div{font-family:Verdana}` governing
+every body paragraph. Verdana has no Chinese glyphs, so once the translation is
+appended the reader falls back **per character** to whatever CJK font the device
+happens to pick: the weight no longer matches (looks washed out), Han characters
+fill the whole em box while the Latin letters around them do not (looks
+oversized), and the mixed-script baseline wobbles. On top of that the source CSS
+usually sets no `line-height` for body text, and the translator's segment
+mapping copies the English spacing into the Chinese output, leaving stray
+spaces at the start/end of translated blocks and inside inline tags
+(`<em> 《书名》 </em>`).
+
+`polish_cjk.py` is a standalone post-processing pass over a finished bilingual
+EPUB that fixes all three:
+
+1. **Tags the translated blocks.** Every block-level element whose *own-level*
+   text is CJK-dominant (weighted `2·CJK / (2·CJK + latin_letters) ≥ 0.15`, at
+   least one CJK character) gets `class="zh-translation"` and
+   `lang`/`xml:lang="zh-CN"`. Descendant block elements are opaque when that
+   text is measured, so container `<div>`s are never tagged but a translated
+   paragraph that wraps an inline `<pre>` still is.
+2. **Injects CSS.** A `<style id="zh-polish">` is appended to each document's
+   `<head>` with a cross-platform Chinese font stack (Latin faces first so Latin
+   words inside a Chinese paragraph keep Latin glyphs), `line-height`,
+   `text-align: justify` with `text-justify: inter-ideograph`, and a monospace
+   reset for `code`/`pre` inside translated blocks. It sets **no colour**, so
+   the source book's `@media (prefers-color-scheme: dark)` rules keep governing
+   the translation exactly as they govern the original. Re-running replaces the
+   block in place instead of stacking a second copy.
+3. **Cleans stray whitespace**, and only inside tagged blocks: runs at the start
+   or end of a block, runs between two CJK characters, and runs next to CJK
+   punctuation are deleted; a run with CJK on one side and Latin on the other
+   collapses to a single space (`使用 pip` keeps its space).
+4. **Embeds a Chinese font subset** (on by default). A font stack alone still
+   leaves rendering up to whatever the device happens to have installed, so the
+   pass subsets a CJK face down to the characters this book actually uses,
+   writes it into the EPUB, registers it in the OPF manifest, adds an
+   `@font-face` to the injected CSS, and splices the family into the **CJK
+   position** of the stack — Latin faces stay ahead of it, so English words and
+   digits inside a translated paragraph keep their Latin glyphs.
+
+Nothing is re-serialised: the parser only produces source offsets, and the edits
+are point replacements on the raw text, so untagged content is byte-identical by
+construction. Repackaging rewrites the source zip entry by entry, preserving
+order, timestamps and attributes, with `mimetype` first and stored — the same
+invariant `pdf_to_epub._repackage_epub` maintains — which also makes the output
+deterministic.
+
+### The embedded font
+
+The subset is built with fontTools at run time from
+`/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc` **font number 2**
+(Noto Sans CJK **SC** — index 0 is the JP face, whose glyph forms are wrong for
+Chinese body text). Noto is OFL-licensed, so embedding and redistributing a
+subset is fine. Output flavour is WOFF, not WOFF2: no brotli module is needed,
+and EPUB3 readers support WOFF more widely than WOFF2 — not worth a dependency
+to save ~30 KB.
+
+Two coverage tiers:
+
+| `--font-coverage` | characters | font bytes | EPUB delta |
+|---|---|---|---|
+| `book` (default) | only what the translation uses (1198 for the reasoning-model book) | 194 KiB | +218 KB |
+| `gb2312` | that ∪ all of GB2312 (7445, generated from Python's `gb2312` codec, no hard-coded table) | 1.24 MiB | +1.30 MB |
+
+Pick `gb2312` when the reader is likely to annotate inside the book: their own
+notes then render in the same face instead of falling back.
+
+The font file follows the book's own convention — it lands in whichever
+directory already holds fonts (`OEBPS/Misc/` next to `JetBrains.woff2` here,
+`OEBPS/fonts/`, or the OPF directory itself), falling back to `Misc/`. Because
+the `<style>` is inlined per document rather than written to a shared CSS file,
+the `@font-face` `src` is resolved **relative to each document**, which matters
+in books whose documents sit at different depths (`OEBPS/` and `OEBPS/xhtml/`).
+Idempotency is per-artefact: one font entry, one `@font-face` per document, one
+manifest item, and re-running reproduces the file byte for byte. Two details
+that determinism depends on — `recalcTimestamp=False` when loading the source
+face (otherwise every save stamps the current time), and stripping
+`<style>`/`<script>` before collecting the character set (the injected stack
+itself contains `微软雅黑`, which would otherwise grow the subset on the second
+run).
+
+If the font source is missing or fontTools cannot load it, the pass **fails
+loudly** with instructions (`apt install fonts-noto-cjk`, `--font-file`,
+`--no-embed-font`) and writes nothing — degrading silently to "no font embedded"
+would leave you believing the book carries one.
+
+```bash
+uv run python polish_cjk.py output/book.epub output/book.polished.epub
+uv run python polish_cjk.py output/book.epub --stats     # count only, no write
+uv run python polish_cjk.py in.epub out.epub --no-embed-font        # skip the font
+uv run python polish_cjk.py in.epub out.epub --font-coverage gb2312
+# knobs: --line-height --font-family --mono-family --text-align
+#        --letter-spacing --threshold --min-cjk
+#        --embed-font/--no-embed-font --font-coverage --font-file --font-number
+```
+
+Measured on `output/从零构建推理模型_中英对照.epub` (26 documents): 1946 blocks
+tagged, 4114 whitespace fixes; CJK `<p>`s starting or ending with whitespace
+went 1132/1160 → 0/0, spaces inside inline tags 180/192 → 0/0. Meanwhile the
+source book's 473 `<pre>` and 1703 `<code>` elements are still present verbatim,
+all 3489 `pre`/`code` fragments in the book are byte-identical before and after,
+all 180 images and every other non-XHTML entry (including `toc.ncx` and the
+26-entry spine) are unchanged, the 25 607 nodes outside translated blocks are
+byte-identical, and running the tool on its own output reproduces the file
+byte for byte. The embedded `book`-tier subset covers all 1198 CJK characters
+in the book with zero misses, and its `@font-face` `src` resolves to the font
+from all 26 documents.
+
+The pass is not book-specific: it has also been run over
+`The Presidents Book of Secrets` (1191 blocks, 2383 characters, font in
+`OEBPS/Misc/`), `The Experience Machine` (764 blocks, 2158 characters, font in
+the publisher's own `OEBPS/fonts/`, documents split across two directories, and
+that book's two pre-existing `@font-face` rules left untouched),
+`Hands-On大语言模型` (772 blocks, 1069 characters, font at the OPF root, all 55
+`<pre>` and 2645 `<code>` byte-identical) and `具身智能` (378 blocks, 879
+characters, `EPUB/` root instead of `OEBPS/`) — every book byte-identical
+outside its XHTML and OPF, with the same coverage and idempotency results.
