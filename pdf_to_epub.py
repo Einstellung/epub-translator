@@ -3,12 +3,15 @@
 Pipeline (every step here was validated against real pages, and every
 workaround encodes a bug we actually hit):
 
-  1. pdf_craft.transform_markdown  -> Markdown + extracted image assets
-     (DeepSeek-OCR; it recognises prose, matrices and inline math well —
-      code blocks are its weak spot, expect to hand-check those.)
-  2. fix LaTeX over-escaping        -> pdf_craft doubles every command
-     backslash inside math spans (\\\\cos, \\\\begin). We restore \\\\<letter>
-     to \\<letter> while preserving real \\\\ matrix row-breaks.
+  1. OCR -> Markdown + extracted image assets. Two engines:
+     --engine deepseek (default) runs DeepSeek-OCR through pdf_craft, which
+     reads prose and matrices well but mangles code blocks;
+     --engine paddle runs PaddleOCR-VL 1.6 out of its own venv (opt-in; its
+     serverless inference path is far too slow to be the default).
+  2. fix LaTeX over-escaping        -> DeepSeek path only: pdf_craft doubles
+     every command backslash inside math spans (\\\\cos, \\\\begin). We restore
+     \\\\<letter> to \\<letter> while preserving real \\\\ matrix row-breaks.
+     PaddleOCR-VL emits plain LaTeX, so the step is skipped.
   3. rewrite image paths to absolute -> pdf_craft's relative
      markdown_assets_path produces references that don't line up with where
      the files actually land, so pandoc can't embed them. Absolute paths fix it.
@@ -25,9 +28,11 @@ workaround encodes a bug we actually hit):
 Usage:
     uv run python pdf_to_epub.py input/book.pdf
     uv run python pdf_to_epub.py input/book.pdf -o output/book.epub --ocr-size base
+    uv run python pdf_to_epub.py input/book.pdf --engine paddle
 """
 
 import argparse
+import os
 import re
 import shutil
 import subprocess
@@ -38,7 +43,6 @@ from copy import deepcopy
 from pathlib import Path
 
 from lxml import etree
-from pdf_craft import transform_markdown
 
 # DeepSeek-OCR resolution tiers (see doc_page_extractor/model.py):
 #   tiny=512  small=640  base=1024  large=1280  gundam=1024+640 crop
@@ -49,6 +53,18 @@ DEFAULT_OCR_SIZE = "base"
 
 # pdf_craft caches OCR models here; reused across runs so we download once.
 MODELS_CACHE = "models"
+
+# PaddleOCR-VL is available with --engine paddle but is NOT the default: its
+# local (serverless) inference path is unusably slow on this hardware — over
+# 300 s for a single page against DeepSeek-OCR's 47 s, with the GPU idle and one
+# CPU core pinned. Upstream "strongly recommends" a vLLM/SGLang/FastDeploy
+# serving backend, which we have not validated. See the README.
+# It also cannot live in this project's venv: paddlex pins pyyaml==6.0.2 and we
+# need pyyaml>=6.0.3, so uv cannot resolve the two together. It gets its own
+# venv and we drive it as a subprocess.
+DEFAULT_ENGINE = "deepseek"
+PADDLE_VENV = Path(__file__).parent / ".venv-paddle"
+PADDLE_RUNNER = Path(__file__).parent / "paddle_ocr.py"
 
 
 def _de_escape_latex(text: str) -> str:
@@ -66,6 +82,38 @@ def _de_escape_latex(text: str) -> str:
     text = re.sub(r"\\\[.*?\\\]", fix_span, text, flags=re.S)
     text = re.sub(r"\\\(.*?\\\)", fix_span, text, flags=re.S)
     return text
+
+
+def _paddle_python() -> str:
+    """Interpreter for the PaddleOCR-VL venv, or exit with install instructions."""
+    override = os.environ.get("PADDLE_PYTHON")
+    if override:
+        return override
+    python = PADDLE_VENV / "bin" / "python"
+    if not python.is_file():
+        sys.exit(
+            f"error: PaddleOCR-VL venv not found at {PADDLE_VENV}.\n"
+            "Create it once (it cannot share this project's venv — paddlex pins\n"
+            "pyyaml==6.0.2 against our pyyaml>=6.0.3):\n\n"
+            f"  uv venv --python 3.12 {PADDLE_VENV}\n"
+            f"  VIRTUAL_ENV={PADDLE_VENV} uv pip install paddlepaddle-gpu==3.3.1 \\\n"
+            "      --index https://www.paddlepaddle.org.cn/packages/stable/cu126/ \\\n"
+            "      --index-strategy unsafe-best-match\n"
+            f"  VIRTUAL_ENV={PADDLE_VENV} uv pip install 'paddleocr[doc-parser]'\n\n"
+            "Or run with --engine deepseek."
+        )
+    return str(python)
+
+
+def _run_paddle(pdf_path: Path, md_path: Path, assets_path: Path) -> None:
+    """OCR the PDF with PaddleOCR-VL in its own venv, writing markdown + assets."""
+    cmd = [
+        _paddle_python(), str(PADDLE_RUNNER),
+        str(pdf_path), str(md_path), str(assets_path),
+    ]
+    result = subprocess.run(cmd)
+    if result.returncode != 0:
+        sys.exit(f"PaddleOCR-VL failed (exit {result.returncode})")
 
 
 def _absolutize_images(text: str, md_dir: Path) -> str:
@@ -280,6 +328,7 @@ def convert(
     pdf_path: Path,
     epub_path: Path,
     ocr_size: str = DEFAULT_OCR_SIZE,
+    engine: str = DEFAULT_ENGINE,
     work_dir: Path | None = None,
     keep_work: bool = False,
     title: str | None = None,
@@ -301,23 +350,35 @@ def convert(
     analysing_path = work_dir / "_ocr"
 
     # 1. OCR -> Markdown
-    print(f"[1/6] OCR {pdf_path.name} -> markdown (ocr_size={ocr_size}) ...", flush=True)
     t0 = time.time()
-    transform_markdown(
-        pdf_path=str(pdf_path),
-        markdown_path=str(md_path),
-        markdown_assets_path=str(assets_path),
-        analysing_path=str(analysing_path),
-        models_cache_path=MODELS_CACHE,
-        ocr_size=ocr_size,
-        includes_footnotes=True,
-    )
+    if engine == "paddle":
+        print(f"[1/6] OCR {pdf_path.name} -> markdown (PaddleOCR-VL) ...", flush=True)
+        _run_paddle(pdf_path, md_path, assets_path)
+    else:
+        print(
+            f"[1/6] OCR {pdf_path.name} -> markdown (DeepSeek-OCR, ocr_size={ocr_size}) ...",
+            flush=True,
+        )
+        from pdf_craft import transform_markdown
+
+        transform_markdown(
+            pdf_path=str(pdf_path),
+            markdown_path=str(md_path),
+            markdown_assets_path=str(assets_path),
+            analysing_path=str(analysing_path),
+            models_cache_path=MODELS_CACHE,
+            ocr_size=ocr_size,
+            includes_footnotes=True,
+        )
     print(f"      OCR done in {time.time() - t0:.1f}s", flush=True)
 
     # 2. fix LaTeX over-escaping  3. absolutize image paths
-    print("[2/6] fixing LaTeX escaping", flush=True)
     text = md_path.read_text(encoding="utf-8")
-    text = _de_escape_latex(text)
+    if engine == "deepseek":
+        print("[2/6] fixing LaTeX escaping", flush=True)
+        text = _de_escape_latex(text)
+    else:
+        print("[2/6] LaTeX escaping: not needed (PaddleOCR-VL emits plain LaTeX)", flush=True)
     print("[3/6] resolving image paths", flush=True)
     text = _absolutize_images(text, md_path.parent)
     md_path.write_text(text, encoding="utf-8")
@@ -369,9 +430,15 @@ def main(argv: list[str] | None = None) -> None:
         help="output EPUB path (default: output/<pdf-stem>.epub)",
     )
     p.add_argument(
+        "--engine", default=DEFAULT_ENGINE, choices=["deepseek", "paddle"],
+        help="OCR engine (default: deepseek, via pdf_craft). paddle = "
+             "PaddleOCR-VL 1.6 in its own .venv-paddle venv; opt-in only, its "
+             "serverless inference needs minutes per page on a 12 GB card.",
+    )
+    p.add_argument(
         "--ocr-size", default=DEFAULT_OCR_SIZE,
         choices=["tiny", "small", "base", "large", "gundam"],
-        help="DeepSeek-OCR resolution tier (default: base)",
+        help="DeepSeek-OCR resolution tier (default: base); ignored by --engine paddle",
     )
     p.add_argument(
         "--keep-work", action="store_true",
@@ -394,6 +461,7 @@ def main(argv: list[str] | None = None) -> None:
         pdf_path=args.pdf,
         epub_path=epub_path,
         ocr_size=args.ocr_size,
+        engine=args.engine,
         keep_work=args.keep_work,
         split_references=args.split_references,
     )

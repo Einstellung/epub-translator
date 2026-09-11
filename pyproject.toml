@@ -6,7 +6,9 @@ readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
     "epub-translator>=0.1.10",
+    "lxml>=6.1.1",
     "pdf-craft>=1.0.13",
     "python-dotenv>=1.2.2",
     "pyyaml>=6.0.3",
+    "torchvision>=0.27.0",
 ]

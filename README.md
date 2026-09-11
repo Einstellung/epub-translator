@@ -268,7 +268,9 @@ uv run python glossary.py "input/My Book.epub" --min-freq 2
 
 Have a PDF instead of an EPUB? Convert it first, then feed the EPUB into the
 translator above. This uses `pdf_craft` + DeepSeek-OCR for layout/text/formula
-recognition and `pandoc` for a clean, math-correct EPUB.
+recognition and `pandoc` for a clean, math-correct EPUB. PaddleOCR-VL 1.6 is
+wired up as an alternative engine; see
+[OCR engines](#ocr-engines---engine-deepseek-default-and---engine-paddle).
 
 ```bash
 uv run python pdf_to_epub.py input/book.pdf                 # -> output/book.epub
@@ -308,6 +310,64 @@ whole page as one image (512/640/1024/1280 px); `gundam` crops dense pages into
 tiles. **`base`** is the default — best quality/VRAM trade-off for normal books
 (peak ~9 GB on a 12 GB card). Use `gundam` for dense, small-font or scanned
 pages; it recognises more but costs more VRAM and time.
+
+### OCR engines: `--engine deepseek` (default) and `--engine paddle`
+
+`--engine paddle` runs **PaddleOCR-VL 1.6** (released 2026-05-28, ~1.0 B
+parameters, BF16) instead of DeepSeek-OCR. It is opt-in, not the default,
+because its serverless inference path is far too slow on a 12 GB RTX 3060:
+
+| page set | DeepSeek-OCR (`base`) | PaddleOCR-VL 1.6 (serverless) |
+| --- | --- | --- |
+| 4 scanned pages (`04-nii-blackboard`) | 117 s, peak 8430 MiB | not reached |
+| 3 two-column pages (`01-leases`) | 135 s, peak 8430 MiB | killed at 41 min, still on page 1–3 |
+| 3 two-column pages with figures (`07-contract-net`) | 150 s, peak 8601 MiB | not reached |
+| 1 page, 3×3 matrix product (`airobotics_p34`) | 47 s, peak 8601 MiB | >300 s, timed out |
+
+During those PaddleOCR-VL runs the GPU sat at 0–19% utilisation with ~8.4 GB
+allocated (Paddle's allocator reserves a fraction of the card up front; the
+model itself needs ~2 GB) while one CPU core stayed pinned at 91%. Layout
+detection does use the GPU; it is the VL recognition step that crawls. This
+matches upstream, which "strongly recommends" running the VLM behind a
+dedicated inference service (`--vl_rec_backend vllm-server` /
+`sglang-server` / `fastdeploy-server`) rather than in-process. **Quality was
+therefore never measured** — no PaddleOCR-VL markdown was produced for any test
+page, so the comparison table has no quality columns and the benchmark claims
+below are upstream's, not ours.
+
+On paper PaddleOCR-VL 1.6 should win: 96.33% overall on OmniDocBench v1.6
+(state of the art at release), SOTA on Real5-OmniDocBench's scanning, warping,
+screen-photography, illumination and skew splits, markdown output with `$…$` /
+`$$…$$` LaTeX, HTML tables, and layout-driven reading order for multi-column
+pages. Published OmniDocBench v1.5 numbers put PaddleOCR-VL-1.5 at 0.075
+overall edit distance against DeepSeek-OCR-2 at 0.100 (text 0.048, formula
+0.198, table 0.096, reading order 0.057); the DeepSeek-OCR we use through
+`pdf_craft` is the earlier v1. Turning that into a real win here means standing
+up a vLLM server and measuring again.
+
+Installing the engine (it **cannot** share this project's venv — `paddlex` pins
+`pyyaml==6.0.2` and we need `pyyaml>=6.0.3`, so `uv` cannot resolve the two
+together; `pdf_to_epub.py` drives it as a subprocess, overridable with
+`PADDLE_PYTHON`):
+
+```bash
+uv venv --python 3.12 .venv-paddle
+VIRTUAL_ENV=.venv-paddle uv pip install paddlepaddle-gpu==3.3.1 \
+    --index https://www.paddlepaddle.org.cn/packages/stable/cu126/ \
+    --index-strategy unsafe-best-match
+VIRTUAL_ENV=.venv-paddle uv pip install 'paddleocr[doc-parser]'
+```
+
+The `cu130` index carries only nightly builds, so we pin the `cu126` stable
+wheel; it runs fine against a CUDA 13.0 driver. Models (~2 GB) download to
+`~/.paddlex/official_models` on first use, and the first run pays ~220 s of
+model loading on top of inference.
+
+`paddle_ocr.py` is the subprocess entry point. It emits the same shape as
+`pdf_craft.transform_markdown` — one markdown file plus an assets directory —
+so steps 3 to 6 of the pipeline, `--split-references` included, are shared by
+both engines. The LaTeX de-escaping of step 2 is DeepSeek-only; PaddleOCR-VL
+emits plain LaTeX.
 
 ### Translating a math EPUB: math is masked automatically
 
