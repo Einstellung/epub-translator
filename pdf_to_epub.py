@@ -10,24 +10,29 @@ workaround encodes a bug we actually hit):
   1. OCR -> Markdown + extracted image assets. PaddleOCR-VL 1.6 runs against
      the vLLM server at ~4 s per page, and it rejoins words hyphenated across
      line and column breaks.
-  2. escape stray angle brackets   -> a BNF grammar printed as <message> =>
+  2. repair the OCR's markdown       -> three faults that cost whole pages:
+     a display-math delimiter the engine never closes swallows the prose after
+     it; `$ x $` is not math to pandoc, which then drops the LaTeX inside it;
+     and an algorithm listing arrives as loose lines that markdown runs
+     together into one paragraph. See _normalise_markdown.
+  3. escape stray angle brackets   -> a BNF grammar printed as <message> =>
      <header> reaches pandoc as raw HTML and lands in the EPUB as an unclosed
      <header> element, i.e. invalid XHTML. A bare tag the document never closes
      becomes text; a void tag is self-closed, since raw <br> is not XHTML either.
-  3. rewrite image paths to absolute -> the engine's relative asset paths do
+  4. rewrite image paths to absolute -> the engine's relative asset paths do
      not line up with where the files actually land, so pandoc can't embed
      them. Absolute paths fix it.
-  4. pandoc --mathml                 -> turns the LaTeX PaddleOCR-VL emits into
+  5. pandoc --mathml                 -> turns the LaTeX PaddleOCR-VL emits into
      MathML. pandoc's matrix handling is correct where the OCR engines' own
      MathML/SVG renderers dropped or flattened matrices.
-  5. strip <annotation> elements     -> pandoc embeds a raw-LaTeX annotation
+  6. strip <annotation> elements     -> pandoc embeds a raw-LaTeX annotation
      beside each MathML formula. Readers that don't fully support <semantics>
      print that annotation as body text, so every formula shows up twice. We
      remove them.
-  6. validate every document         -> the translator parses with xml.etree
+  7. validate every document         -> the translator parses with xml.etree
      and dies on the first malformed file, mid-book. We parse each document
      here instead, and refuse to ship an EPUB that won't parse.
-  7. repackage                       -> rebuild the EPUB zip with mimetype
+  8. repackage                       -> rebuild the EPUB zip with mimetype
      stored first and uncompressed, as the spec requires.
 
 Usage:
@@ -270,6 +275,274 @@ def _run_paddle(
     result = subprocess.run(cmd)
     if result.returncode != 0:
         sys.exit(f"PaddleOCR-VL failed (exit {result.returncode})")
+
+
+# --- markdown repair, between OCR and pandoc -------------------------------
+#
+# Each of the three faults below was measured on arXiv 2608.25512, a 92-page A4
+# paper and the first long document this pipeline ran end to end.
+
+_DISPLAY_OPEN = re.compile(r"(?<!\\)\\\[")
+_DISPLAY_CLOSE = re.compile(r"(?<!\\)\\\]")
+
+# One inline-math pair, padding optional. It has to match the tight pairs too:
+# the pairs are consumed left to right, and a pattern that skipped `$x$` would
+# then read the gap after it, `$ yields a pair $`, as the next formula.
+_INLINE_MATH = re.compile(r"(?<![$\\])\$[ \t]*([^$\n]*?)[ \t]*\$(?!\$)")
+
+# One line of pseudocode. Keywords are matched case-sensitively and lowercase:
+# an English sentence starts with a capital, so `for` and `if` here cost almost
+# nothing in false positives, while `For` and `If` would be expensive.
+_PSEUDOCODE_STEP = re.compile(
+    r"""^[ \t]*(?:
+        \d{1,3}[.:)]?[ \t]                      # numbered step: "12 async ..."
+      | \|                                      # the engine's indent marker
+      | (?:async[ \t]+)?function\b | (?:sub)?procedure\b | method\b
+      | (?:Input|Output|Require|Ensure|Data|Result)[ \t]*:
+      | for\b | foreach\b | while\b | repeat\b | until\b | do\b
+      | if\b | else\b | elif\b | then\b | switch\b | case\b
+      | return\b | break\b | continue\b | yield\b
+      | end\b | let\b | assert\b | await\b
+    )""",
+    re.VERBOSE,
+)
+# `Algorithm 7 Isolation realm reassignment`: a caption, not a sentence about one.
+_ALGORITHM_CAPTION = re.compile(r"^Algorithm[ \t]+\d+[ \t]+[A-Z][^.]{0,60}$")
+# A short line that is prose: a capitalised start and a full stop at the end.
+_SENTENCE = re.compile(r"^[A-Z][^|]*\.$")
+_PSEUDOCODE_MIN_LINES = 4
+_PSEUDOCODE_MAX_WIDTH = 100
+_PSEUDOCODE_MIN_RATIO = 0.8
+
+
+def _markdown_blocks(text: str):
+    """Yield (start, stop) line ranges of the paragraphs pandoc will see.
+
+    A paragraph is a run of non-blank lines; fenced code, headings and blank
+    lines are not paragraphs and are never yielded, so a caller may rewrite any
+    range it gets without touching code or structure.
+    """
+    lines = text.split("\n")
+    fence: str | None = None
+    i = 0
+    while i < len(lines):
+        stripped = lines[i].lstrip()
+        if fence is not None:
+            if stripped.startswith(fence):
+                fence = None
+            i += 1
+            continue
+        if stripped.startswith(("```", "~~~")):
+            fence = stripped[:3]
+            i += 1
+            continue
+        if not stripped or stripped.startswith("#"):
+            i += 1
+            continue
+        j = i + 1
+        while (j < len(lines) and lines[j].strip()
+               and not lines[j].lstrip().startswith(("#", "```", "~~~"))):
+            j += 1
+        yield i, j
+        i = j
+
+
+def _close_display_math(text: str) -> tuple[str, int, int]:
+    r"""Close a display-math delimiter the engine opened and never closed.
+
+    pandoc's math parser runs from `\[` to the next `\]` wherever that is, so one
+    dropped closer swallows everything up to the next formula: on 2608.25512 a
+    single unterminated `\[` (the OCR of a commutative diagram, whose \begin{array}
+    came out unbalanced) absorbed 6725 characters — prose, a figure and 54 inline
+    formulas — into one unrenderable span. Closing it at the end of its own
+    paragraph keeps the damage to the one formula. An odd number of `$$` in a
+    paragraph is the same fault in the other delimiter.
+
+    Paragraph-scoped, not line-scoped, because a display formula may legitimately
+    run over several lines. Returns (text, `\]` added, `$$` added).
+    """
+    lines = text.split("\n")
+    brackets = dollars = 0
+    for start, stop in _markdown_blocks(text):
+        block = "\n".join(lines[start:stop])
+        missing = len(_DISPLAY_OPEN.findall(block)) - len(_DISPLAY_CLOSE.findall(block))
+        suffix = ""
+        if missing > 0:
+            suffix += "\\]" * missing
+            brackets += missing
+        if block.count("$$") % 2:
+            suffix += "$$"
+            dollars += 1
+        if suffix:
+            lines[stop - 1] = lines[stop - 1].rstrip() + suffix
+    return "\n".join(lines), brackets, dollars
+
+
+def _tighten_inline_math(text: str) -> tuple[str, int]:
+    r"""Rewrite `$ x $` as `$x$`, which is the only form pandoc reads as math.
+
+    pandoc's tex_math_dollars requires no space after the opening `$` and none
+    before the closing one. PaddleOCR-VL pads both (1218 pairs on 2608.25512),
+    and the cost is not just unrendered math: `markdown+raw_tex` then reads the
+    `\Gamma` inside as raw inline TeX and drops it from the HTML, so `$ \Gamma_n $`
+    reaches the reader as `$ _n $`. Tightening the delimiters took this paper
+    from 764 to 1974 `<math>` elements.
+
+    Fenced code and `$$` display blocks are left alone. Returns (text, pairs).
+    """
+    fixed = 0
+
+    def tighten(match: re.Match) -> str:
+        nonlocal fixed
+        inner = match.group(1).strip()
+        tight = f"${inner}$"
+        if not inner or match.group(0) == tight:
+            return match.group(0)   # nothing inside, or already tight
+        fixed += 1
+        return tight
+
+    out: list[str] = []
+    fence: str | None = None
+    display = False
+    for line in text.splitlines(keepends=True):
+        stripped = line.lstrip()
+        if fence is not None:
+            out.append(line)
+            if stripped.startswith(fence):
+                fence = None
+            continue
+        if stripped.startswith(("```", "~~~")):
+            fence = stripped[:3]
+            out.append(line)
+            continue
+        # A line with an odd number of `$$` opens (or closes) a display block;
+        # leave every line of one untouched, delimiters included.
+        odd = line.count("$$") % 2 == 1
+        if display or odd:
+            out.append(line)
+            display = display != odd
+            continue
+        out.append(_INLINE_MATH.sub(tighten, line))
+    return "".join(out), fixed
+
+
+def _is_pseudocode_line(line: str) -> bool:
+    """A short line that reads as one step of an algorithm, not as prose."""
+    if len(line) > _PSEUDOCODE_MAX_WIDTH:
+        return False
+    stripped = line.lstrip()
+    if stripped.startswith(("#", "```", "~~~", "<", ">", "![", "*", "-")):
+        return False
+    if stripped.startswith("|") and line.rstrip().endswith("|"):
+        return False  # a markdown table row
+    return True
+
+
+def _fence_captioned_algorithms(text: str) -> tuple[str, int]:
+    """Fence the lines that follow an `Algorithm N Title` caption.
+
+    The caption is the strong signal, so the lines after it need only be short
+    and non-prose; blank lines between them are dropped, which rejoins a listing
+    the engine split across a page break. Collection stops at the first long
+    line, which is how the surrounding prose ends up outside the fence — the
+    paper's own paragraphs are one line each and far longer than a step.
+    """
+    lines = text.split("\n")
+    out: list[str] = []
+    fence: str | None = None
+    fenced = 0
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        stripped = line.lstrip()
+        if fence is not None:
+            out.append(line)
+            if stripped.startswith(fence):
+                fence = None
+            i += 1
+            continue
+        if stripped.startswith(("```", "~~~")):
+            fence = stripped[:3]
+            out.append(line)
+            i += 1
+            continue
+        out.append(line)
+        i += 1
+        if not _ALGORITHM_CAPTION.match(line):
+            continue
+        body: list[tuple[int, str]] = []
+        j = i
+        while j < len(lines):
+            if not lines[j].strip():
+                j += 1
+                continue
+            if not _is_pseudocode_line(lines[j]):
+                break
+            body.append((j, lines[j]))
+            j += 1
+        # Only a trailing line that is plainly a sentence is dropped: a step is
+        # as likely to end in `fiber.parent.fiber` as in a keyword.
+        while body and _SENTENCE.match(body[-1][1]):
+            body.pop()
+        steps = sum(1 for _, b in body if _PSEUDOCODE_STEP.match(b))
+        if len(body) < 3 or steps * 2 < len(body):
+            continue
+        out.extend(["", "```", *(b for _, b in body), "```"])
+        fenced += 1
+        i = body[-1][0] + 1
+    return "\n".join(out), fenced
+
+
+def _fence_pseudocode_paragraphs(text: str) -> tuple[str, int]:
+    """Fence a paragraph that is a listing whose caption the engine dropped.
+
+    With no caption to lean on the test has to be narrow, because a false
+    positive sets prose in monospace: at least four consecutive short lines, four
+    fifths of which read as a step.
+    """
+    lines = text.split("\n")
+    fenced = 0
+    # Rewrite from the end so the earlier ranges stay valid as fences go in.
+    for start, stop in reversed(list(_markdown_blocks(text))):
+        block = lines[start:stop]
+        if len(block) < _PSEUDOCODE_MIN_LINES:
+            continue
+        if not all(_is_pseudocode_line(line) for line in block):
+            continue
+        steps = sum(1 for line in block if _PSEUDOCODE_STEP.match(line))
+        if steps < _PSEUDOCODE_MIN_LINES or steps < _PSEUDOCODE_MIN_RATIO * len(block):
+            continue
+        lines[start:stop] = ["```", *block, "```"]
+        fenced += 1
+    return "\n".join(lines), fenced
+
+
+def _fence_pseudocode(text: str) -> tuple[str, int]:
+    """Fence the algorithm listings the engine emits as loose lines.
+
+    PaddleOCR-VL puts each line of an algorithm on its own markdown line with no
+    fence, so markdown joins the lot into one run-on paragraph: an 18-line
+    algorithm becomes a sentence, the line structure is lost, and `mask_code` in
+    the translator has nothing to protect (it only sees marked-up code).
+
+    Two passes, because half the listings on 2608.25512 kept their caption and
+    half did not. Returns (text, blocks fenced).
+    """
+    text, captioned = _fence_captioned_algorithms(text)
+    text, loose = _fence_pseudocode_paragraphs(text)
+    return text, captioned + loose
+
+
+def _normalise_markdown(text: str) -> str:
+    """Repair the OCR's markdown so pandoc reads what the page said."""
+    text, brackets, dollars = _close_display_math(text)
+    print(f"      closed {brackets} unterminated \\[ and {dollars} unterminated $$",
+          flush=True)
+    text, pairs = _tighten_inline_math(text)
+    print(f"      tightened {pairs} space-padded inline-math pair(s)", flush=True)
+    text, blocks = _fence_pseudocode(text)
+    print(f"      fenced {blocks} pseudocode block(s)", flush=True)
+    return text
 
 
 def _escape_stray_tags(text: str) -> tuple[str, int, int]:
@@ -684,21 +957,23 @@ def convert(
 
     # 1. OCR -> Markdown
     t0 = time.time()
-    print(f"[1/7] OCR {pdf_path.name} -> markdown (PaddleOCR-VL) ...", flush=True)
+    print(f"[1/8] OCR {pdf_path.name} -> markdown (PaddleOCR-VL) ...", flush=True)
     _ocr(pdf_path, md_path, assets_path, work_dir, server_url)
     print(f"      OCR done in {time.time() - t0:.1f}s", flush=True)
 
-    # 2. escape stray angle brackets  3. absolutize image paths
+    # 2. repair the markdown  3. escape stray angle brackets  4. image paths
     text = md_path.read_text(encoding="utf-8")
+    print("[2/8] repairing the OCR's markdown", flush=True)
+    text = _normalise_markdown(text)
     text, escaped, closed_up = _escape_stray_tags(text)
-    print(f"[2/7] escaped {escaped} <tag> sequence(s) that are text, "
+    print(f"[3/8] escaped {escaped} <tag> sequence(s) that are text, "
           f"self-closed {closed_up} void tag(s)", flush=True)
-    print("[3/7] resolving image paths", flush=True)
+    print("[4/8] resolving image paths", flush=True)
     text = _absolutize_images(text, md_path.parent)
     md_path.write_text(text, encoding="utf-8")
 
     # 4. pandoc -> EPUB with MathML
-    print("[4/7] pandoc -> EPUB (MathML)", flush=True)
+    print("[5/8] pandoc -> EPUB (MathML)", flush=True)
     raw_epub = work_dir / "raw.epub"
     cmd = [
         "pandoc", str(md_path), "-o", str(raw_epub),
@@ -710,7 +985,7 @@ def convert(
         sys.exit(f"pandoc failed:\n{result.stderr}")
 
     # 5. strip annotations  6. validate  7. repackage
-    print("[5/7] stripping LaTeX annotation duplicates", flush=True)
+    print("[6/8] stripping LaTeX annotation duplicates", flush=True)
     epub_extract = work_dir / "epub"
     if epub_extract.exists():
         shutil.rmtree(epub_extract)
@@ -721,14 +996,14 @@ def convert(
     print(f"      removed {removed} annotation(s)", flush=True)
 
     if split_references:
-        print("[5b/7] splitting off References section", flush=True)
+        print("[6b/8] splitting off References section", flush=True)
         print(f"      {_split_references(epub_extract)}", flush=True)
 
-    print("[6/7] validating XML", flush=True)
+    print("[7/8] validating XML", flush=True)
     checked, rewritten = _validate_xml(epub_extract)
     print(f"      {checked} document(s) parse, {rewritten} rewritten", flush=True)
 
-    print("[7/7] repackaging EPUB", flush=True)
+    print("[8/8] repackaging EPUB", flush=True)
     _repackage_epub(epub_extract, epub_path)
 
     if not keep_work:
