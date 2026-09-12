@@ -1,181 +1,330 @@
 """Convert a PDF into a clean, math-correct EPUB ready for translation.
 
+OCR is PaddleOCR-VL 1.6 driven through a local vLLM inference server. The
+script starts that server itself unless you point `--server-url` at one you
+already run, and kills what it started before it exits.
+
 Pipeline (every step here was validated against real pages, and every
 workaround encodes a bug we actually hit):
 
-  1. OCR -> Markdown + extracted image assets. Two engines:
-     --engine paddle (default) runs PaddleOCR-VL 1.6 out of its own venv
-     against a vLLM server you start first: ~4 s per page, and it rejoins
-     words hyphenated across line and column breaks;
-     --engine deepseek runs DeepSeek-OCR through pdf_craft, needs no server,
-     takes ~6x longer per page and mangles code blocks.
-  2. fix LaTeX over-escaping        -> DeepSeek path only: pdf_craft doubles
-     every command backslash inside math spans (\\\\cos, \\\\begin). We restore
-     \\\\<letter> to \\<letter> while preserving real \\\\ matrix row-breaks.
-     PaddleOCR-VL emits plain LaTeX, so the step is skipped.
-  3. rewrite image paths to absolute -> pdf_craft's relative
-     markdown_assets_path produces references that don't line up with where
-     the files actually land, so pandoc can't embed them. Absolute paths fix it.
-  4. pandoc --mathml                 -> turns the (now valid) LaTeX into
-     MathML. pandoc's matrix handling is correct where pdf_craft's own
-     MathML/SVG/CLIPPING renderers dropped or flattened matrices.
+  1. OCR -> Markdown + extracted image assets. PaddleOCR-VL 1.6 runs against
+     the vLLM server at ~4 s per page, and it rejoins words hyphenated across
+     line and column breaks.
+  2. escape stray angle brackets   -> a BNF grammar printed as <message> =>
+     <header> reaches pandoc as raw HTML and lands in the EPUB as an unclosed
+     <header> element, i.e. invalid XHTML. Names that are not HTML elements are
+     escaped back into text first.
+  3. rewrite image paths to absolute -> the engine's relative asset paths do
+     not line up with where the files actually land, so pandoc can't embed
+     them. Absolute paths fix it.
+  4. pandoc --mathml                 -> turns the LaTeX PaddleOCR-VL emits into
+     MathML. pandoc's matrix handling is correct where the OCR engines' own
+     MathML/SVG renderers dropped or flattened matrices.
   5. strip <annotation> elements     -> pandoc embeds a raw-LaTeX annotation
-     beside each MathML formula. Readers that don't fully support
-     <semantics> print that annotation as body text, so every formula shows
-     up twice. We remove them.
-  6. repackage                       -> rebuild the EPUB zip with mimetype
+     beside each MathML formula. Readers that don't fully support <semantics>
+     print that annotation as body text, so every formula shows up twice. We
+     remove them.
+  6. validate every document         -> the translator parses with xml.etree
+     and dies on the first malformed file, mid-book. We parse each document
+     here instead, and refuse to ship an EPUB that won't parse.
+  7. repackage                       -> rebuild the EPUB zip with mimetype
      stored first and uncompressed, as the spec requires.
 
 Usage:
     uv run python pdf_to_epub.py input/book.pdf
-    uv run python pdf_to_epub.py input/book.pdf -o output/book.epub --ocr-size base
-    uv run python pdf_to_epub.py input/book.pdf --engine paddle
+    uv run python pdf_to_epub.py input/paper.pdf --split-references
+    uv run python pdf_to_epub.py input/book.pdf --server-url http://host:8118/v1
 """
 
 import argparse
+import math
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import time
+import xml.etree.ElementTree as ElementTree
 import zipfile
 from copy import deepcopy
 from pathlib import Path
 
 from lxml import etree
 
-# DeepSeek-OCR resolution tiers (see doc_page_extractor/model.py):
-#   tiny=512  small=640  base=1024  large=1280  gundam=1024+640 crop
-# base is the sweet spot for normally-typeset books on a 12GB GPU
-# (peak ~9GB, no crop). gundam (the pdf_craft default) crops into tiles and
-# is better for dense/small-font/scanned pages but costs more VRAM and time.
-DEFAULT_OCR_SIZE = "base"
+HERE = Path(__file__).parent
+PADDLE_RUNNER = HERE / "paddle_ocr.py"
+PADDLE_MODEL = "PaddleOCR-VL-1.6-0.9B"
+PADDLE_SERVER_PORT = 8118
+PADDLE_SERVER_URL = f"http://localhost:{PADDLE_SERVER_PORT}/v1"
+VLLM_CONFIG = HERE / "vllm_12gb.yaml"
 
-# pdf_craft caches OCR models here; reused across runs so we download once.
-# Anchored to this file, not the working directory: run from elsewhere with a
-# relative path and pdf_craft silently re-downloads 6.3 GB into whatever
-# directory you happened to be in.
-MODELS_CACHE = str(Path(__file__).parent / "models")
+# How long to wait for the server to answer /health. Loading the weights and
+# capturing CUDA graphs takes ~60 s on an RTX 3060; the ceiling is generous
+# because a first run also downloads the model.
+SERVER_READY_TIMEOUT = 600
 
-# PaddleOCR-VL behind a vLLM server is the default: measured on the same pages,
-# 3.8-4.7 s per page against DeepSeek-OCR's 24-42 s, with equal or better
-# markdown (consistent heading levels, hyphenation rejoined across line and
-# column breaks, native $...$ LaTeX). It needs a server: PaddleOCR-VL's
-# in-process recognition path is minutes per page on this hardware, so
-# _require_paddle_server refuses to start rather than run in it by accident.
-# The engine cannot live in this project's venv either: paddlex pins
-# pyyaml==6.0.2 and we need pyyaml>=6.0.3, so uv cannot resolve the two
-# together. It gets its own venv and we drive it as a subprocess.
-DEFAULT_ENGINE = "paddle"
-PADDLE_VENV = Path(__file__).parent / ".venv-paddle"
-PADDLE_RUNNER = Path(__file__).parent / "paddle_ocr.py"
-PADDLE_VL_BACKEND = "vllm-server"
-PADDLE_SERVER_URL = "http://localhost:8118/v1"
+# VRAM the OCR *client* needs beside the server: PaddleOCR-VL's layout detector
+# plus paddle's allocator and the page bitmaps. Measured peak on this repo's
+# test pages is ~2.6 GB (scanned pages are the worst case), so we hold back
+# 3 GB. Do not lower this to the ~1.5 GB the layout weights suggest: leaving
+# only 2.7 GB for the client is exactly the OOM we hit at
+# gpu-memory-utilization 0.62 with a 1.3 GB desktop on the card.
+CLIENT_RESERVE_MIB = 3072
+
+# Below this the server has no room left for a KV cache worth having, so we
+# stop rather than start something that will die during profiling.
+MIN_GPU_UTILISATION = 0.35
+
+# HTML element names. Anything else inside <...> in the OCR markdown is text
+# that happens to look like a tag (BNF non-terminals, <EOF>, <name>), and has
+# to be escaped before pandoc treats it as raw HTML. MathML and SVG names are
+# included because pandoc's own math output uses them.
+_HTML_ELEMENTS = frozenset(
+    """a abbr address area article aside audio b base bdi bdo blockquote body br
+    button canvas caption cite code col colgroup data datalist dd del details
+    dfn dialog div dl dt em embed fieldset figcaption figure footer form h1 h2
+    h3 h4 h5 h6 head header hgroup hr html i iframe img input ins kbd label
+    legend li link main map mark menu meta meter nav noscript object ol optgroup
+    option output p param picture pre progress q rp rt ruby s samp script search
+    section select slot small source span strong style sub summary sup table
+    tbody td template textarea tfoot th thead time title tr track u ul var video
+    wbr
+    math mi mn mo mrow ms mspace msqrt mroot mfrac msub msup msubsup munder
+    mover munderover mmultiscripts mtable mtr mtd mtext merror mpadded mphantom
+    mstyle menclose semantics annotation
+    svg g path circle ellipse line polyline polygon rect text tspan defs use
+    """.split()
+)
 
 
-def _de_escape_latex(text: str) -> str:
-    """Undo pdf_craft's double-backslash over-escaping inside math spans.
-
-    pdf_craft emits math as \\[ ... \\] and \\( ... \\) but doubles every
-    command backslash inside (\\\\cos -> should be \\cos). A genuine matrix
-    row-break is also \\\\, but it is followed by whitespace or a brace, not a
-    letter, so de-escaping only \\\\<letter> leaves row-breaks intact.
-    """
-
-    def fix_span(m: re.Match) -> str:
-        return re.sub(r"\\\\([A-Za-z])", r"\\\1", m.group(0))
-
-    text = re.sub(r"\\\[.*?\\\]", fix_span, text, flags=re.S)
-    text = re.sub(r"\\\(.*?\\\)", fix_span, text, flags=re.S)
-    return text
-
-
-def _paddle_python() -> str:
-    """Interpreter for the PaddleOCR-VL venv, or exit with install instructions."""
-    override = os.environ.get("PADDLE_PYTHON")
-    if override:
-        return override
-    python = PADDLE_VENV / "bin" / "python"
-    if not python.is_file():
+def _gpu_memory_mib() -> tuple[int, int]:
+    """Return (free, total) VRAM in MiB for GPU 0, via nvidia-smi."""
+    out = subprocess.run(
+        ["nvidia-smi", "--query-gpu=memory.free,memory.total",
+         "--format=csv,noheader,nounits", "--id=0"],
+        capture_output=True, text=True,
+    )
+    if out.returncode != 0:
         sys.exit(
-            f"error: PaddleOCR-VL venv not found at {PADDLE_VENV}.\n"
-            "Create it once (it cannot share this project's venv — paddlex pins\n"
-            "pyyaml==6.0.2 against our pyyaml>=6.0.3):\n\n"
-            f"  uv venv --python 3.12 {PADDLE_VENV}\n"
-            f"  VIRTUAL_ENV={PADDLE_VENV} uv pip install paddlepaddle-gpu==3.3.1 \\\n"
-            "      --index https://www.paddlepaddle.org.cn/packages/stable/cu126/ \\\n"
-            "      --index-strategy unsafe-best-match\n"
-            f"  VIRTUAL_ENV={PADDLE_VENV} uv pip install 'paddleocr[doc-parser]'\n\n"
-            "Or run with --engine deepseek."
+            "error: nvidia-smi failed, so the server's VRAM budget cannot be "
+            f"computed:\n{out.stderr.strip()}"
         )
-    return str(python)
+    free, total = (int(v.strip()) for v in out.stdout.strip().split(",")[:2])
+    return free, total
 
 
-def _require_paddle_server(server_url: str) -> None:
-    """Fail fast unless the PaddleOCR-VL inference server is answering.
+def _gpu_utilisation_budget() -> float:
+    """Pick vLLM's gpu-memory-utilization from what is free right now.
 
-    Without one PaddleOCR-VL recognises in-process, which measured at over
-    300 s for a single page here (GPU idle, one CPU core pinned) — slow enough
-    that a silent fallback looks like a hang.
+    vLLM reads the flag as a fraction of *total* VRAM and refuses to start
+    unless that much is free (see v1/worker/gpu_worker.py), so a value fixed in
+    a config file is wrong as soon as the desktop's own usage moves — the 0.62
+    we used to ship dies with a browser open. We leave CLIENT_RESERVE_MIB for
+    the OCR client and round the rest down to a multiple of 0.05.
     """
+    free, total = _gpu_memory_mib()
+    usable = free - CLIENT_RESERVE_MIB
+    budget = math.floor(usable / total * 20) / 20 if usable > 0 else 0.0
+    if budget < MIN_GPU_UTILISATION:
+        sys.exit(
+            "error: not enough free VRAM to run the OCR server.\n"
+            f"  free {free} MiB of {total} MiB, minus {CLIENT_RESERVE_MIB} MiB "
+            f"reserved for the OCR client, leaves a budget of {budget:.2f} "
+            f"(floor {MIN_GPU_UTILISATION:.2f}).\n"
+            "Close what else is on the card, or point --server-url at a server "
+            "on another machine."
+        )
+    return budget
+
+
+def _server_healthy(server_url: str, timeout: float = 3.0) -> bool:
+    """True if a PaddleOCR-VL genai server answers /health at that endpoint."""
     import urllib.error
     import urllib.request
 
     health = server_url.rsplit("/v1", 1)[0].rstrip("/") + "/health"
     try:
-        with urllib.request.urlopen(health, timeout=3) as resp:
-            if resp.status == 200:
-                return
+        with urllib.request.urlopen(health, timeout=timeout) as resp:
+            return resp.status == 200
     except (urllib.error.URLError, OSError):
-        pass
-    sys.exit(
-        f"error: no PaddleOCR-VL inference server at {server_url}.\n"
-        "Start one first (it holds ~7 GB of VRAM while it runs):\n\n"
-        f"  VIRTUAL_ENV={PADDLE_VENV} {PADDLE_VENV}/bin/paddleocr genai_server \\\n"
-        "      --model_name PaddleOCR-VL-1.6-0.9B --backend vllm --port 8118 \\\n"
-        "      --backend_config vllm_12gb.yaml\n\n"
-        "Or run with --engine deepseek, which needs no server."
+        return False
+
+
+def _backend_config(work_dir: Path, utilisation: float) -> Path:
+    """Write this run's vLLM backend config: the checked-in knobs from
+    vllm_12gb.yaml plus the memory budget computed from the card's state."""
+    base = VLLM_CONFIG.read_text(encoding="utf-8") if VLLM_CONFIG.is_file() else ""
+    path = work_dir / "vllm_backend.yaml"
+    path.write_text(
+        f"{base.rstrip()}\ngpu-memory-utilization: {utilisation:.2f}\n",
+        encoding="utf-8",
     )
+    return path
+
+
+class PaddleServer:
+    """The vLLM inference server, started by us and killed by us.
+
+    It runs in its own session so the whole tree (vLLM forks workers) can be
+    signalled at once, and `stop` runs from a finally block and from the
+    SIGINT/SIGTERM handlers — a server left behind holds most of the card.
+    """
+
+    def __init__(self, work_dir: Path, utilisation: float) -> None:
+        self.log_path = work_dir / "vllm-server.log"
+        self.utilisation = utilisation
+        config = _backend_config(work_dir, utilisation)
+        cmd = [
+            "paddleocr", "genai_server",
+            "--model_name", PADDLE_MODEL,
+            "--backend", "vllm",
+            "--port", str(PADDLE_SERVER_PORT),
+            "--backend_config", str(config),
+        ]
+        if shutil.which("paddleocr") is None:
+            cmd[:1] = [sys.executable, "-m", "paddleocr"]
+        self.log = self.log_path.open("w", encoding="utf-8")
+        self.proc = subprocess.Popen(
+            cmd, stdout=self.log, stderr=subprocess.STDOUT, start_new_session=True,
+        )
+        print(
+            f"      started vLLM server pid {self.proc.pid}, "
+            f"gpu-memory-utilization {utilisation:.2f}, log {self.log_path}",
+            flush=True,
+        )
+
+    def wait_ready(self, server_url: str, timeout: int = SERVER_READY_TIMEOUT) -> None:
+        started = time.time()
+        while time.time() - started < timeout:
+            if self.proc is not None and self.proc.poll() is not None:
+                code = self.proc.returncode
+                self.stop()
+                sys.exit(
+                    f"error: the vLLM server exited with code {code} before it "
+                    f"was ready. Last lines of {self.log_path}:\n" + self._log_tail()
+                )
+            if _server_healthy(server_url):
+                print(f"      server ready after {time.time() - started:.0f}s",
+                      flush=True)
+                return
+            time.sleep(2)
+        self.stop()
+        sys.exit(
+            f"error: the vLLM server did not answer {server_url} within "
+            f"{timeout}s. Last lines of {self.log_path}:\n" + self._log_tail()
+        )
+
+    def _log_tail(self, lines: int = 25) -> str:
+        try:
+            text = self.log_path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return "  (log unreadable)"
+        return "\n".join("  " + line for line in text.splitlines()[-lines:])
+
+    def stop(self) -> None:
+        """Kill the server's process group. Safe to call more than once."""
+        proc, self.proc = self.proc, None
+        if proc is None:
+            return
+        print(f"      stopping vLLM server pid {proc.pid}", flush=True)
+        for sig, grace in ((signal.SIGTERM, 20), (signal.SIGKILL, 5)):
+            if proc.poll() is not None:
+                break
+            try:
+                os.killpg(os.getpgid(proc.pid), sig)
+            except (ProcessLookupError, PermissionError):
+                break
+            try:
+                proc.wait(timeout=grace)
+            except subprocess.TimeoutExpired:
+                continue
+        try:
+            self.log.close()
+        except OSError:
+            pass
 
 
 def _run_paddle(
     pdf_path: Path,
     md_path: Path,
     assets_path: Path,
-    vl_backend: str | None = None,
-    server_url: str | None = None,
+    server_url: str,
 ) -> None:
-    """OCR the PDF with PaddleOCR-VL in its own venv, writing markdown + assets."""
-    if vl_backend == "vllm-server":
-        _require_paddle_server(server_url or PADDLE_SERVER_URL)
+    """OCR the PDF with PaddleOCR-VL, writing markdown + assets.
+
+    A subprocess, not an import: paddle's GPU allocator goes away with it, and a
+    hard crash in the OCR client comes back as an exit code we can report
+    instead of taking the server down with it.
+    """
     cmd = [
-        _paddle_python(), str(PADDLE_RUNNER),
+        sys.executable, str(PADDLE_RUNNER),
         str(pdf_path), str(md_path), str(assets_path),
+        "--vl-backend", "vllm-server", "--server-url", server_url,
     ]
-    if vl_backend:
-        cmd += ["--vl-backend", vl_backend]
-    if server_url:
-        cmd += ["--server-url", server_url]
     result = subprocess.run(cmd)
     if result.returncode != 0:
         sys.exit(f"PaddleOCR-VL failed (exit {result.returncode})")
 
 
-def _resolve_asset(rel: str, md_dir: Path) -> Path | None:
-    """Find the file an OCR engine's relative image reference points at.
+def _escape_stray_tags(text: str) -> tuple[str, int]:
+    """Escape <word> sequences that are not HTML elements, outside code.
 
-    Neither engine's relative paths line up with where the files land.
-    pdf_craft adds a nested pdf_test/pdf_test/assets/ layer; PaddleOCR-VL
-    writes imgs/<name> into the markdown while paddle_ocr.py saves the image
-    flat under the assets directory. Both resolve against the candidate list.
+    The Contract Net paper prints its message grammar as `<message> => <header>
+    <addressee> ...`. pandoc reads those as raw HTML, so the EPUB gets an
+    unclosed <header> and stops being well-formed XHTML; the translator then
+    fails on that file. PaddleOCR-VL escapes such names itself on some pages and
+    not others, so we normalise: a name that is not an HTML element becomes
+    literal text.
+
+    Code is left alone (a backslash inside a code span would be printed), and so
+    is anything the engine already escaped.
+    """
+    pattern = re.compile(r"(?<!\\)<(/?)([A-Za-z][A-Za-z0-9._:-]*)>")
+    escaped = 0
+
+    def sub(m: re.Match) -> str:
+        nonlocal escaped
+        if m.group(2).lower() in _HTML_ELEMENTS:
+            return m.group(0)
+        escaped += 1
+        return f"\\<{m.group(1)}{m.group(2)}\\>"
+
+    out: list[str] = []
+    fence: str | None = None
+    for line in text.splitlines(keepends=True):
+        stripped = line.lstrip()
+        if fence is not None:
+            out.append(line)
+            if stripped.startswith(fence):
+                fence = None
+            continue
+        if stripped.startswith(("```", "~~~")):
+            fence = stripped[:3]
+            out.append(line)
+            continue
+        # Split on inline code spans and rewrite only the parts outside them.
+        parts = re.split(r"(`+[^`]*`+)", line)
+        out.append("".join(
+            part if i % 2 else pattern.sub(sub, part)
+            for i, part in enumerate(parts)
+        ))
+    return "".join(out), escaped
+
+
+def _resolve_asset(rel: str, md_dir: Path) -> Path | None:
+    """Find the file the OCR engine's relative image reference points at.
+
+    PaddleOCR-VL writes imgs/<name> into the markdown while paddle_ocr.py saves
+    the image flat under the assets directory, so the reference never resolves
+    as written. The candidate list covers that and the older layouts.
     """
     name = Path(rel).name
     candidates = [
         md_dir / rel,
         md_dir / name,
         md_dir / "assets" / name,
-        md_dir / md_dir.name / "assets" / name,  # nested-dir bug
+        md_dir / md_dir.name / "assets" / name,
         md_dir / "_tmp" / "assets" / name,
     ]
     for c in candidates:
@@ -188,9 +337,9 @@ def _resolve_asset(rel: str, md_dir: Path) -> Path | None:
 def _absolutize_images(text: str, md_dir: Path) -> str:
     """Rewrite image references to absolute paths, so pandoc can embed them.
 
-    Covers both syntaxes the engines emit: pdf_craft writes ![](rel/path),
-    PaddleOCR-VL writes an <img src="rel/path"> inside a centring <div>.
-    An unresolvable reference is left alone and reported, never dropped.
+    Covers both syntaxes the engine emits: ![](rel/path) for a plain figure, and
+    an <img src="rel/path"> inside a centring <div> for a scaled one. An
+    unresolvable reference is left alone and reported, never dropped.
     """
 
     def warn(rel: str) -> None:
@@ -240,6 +389,50 @@ def _strip_annotations(epub_dir: Path) -> int:
         xhtml.write_text(html, encoding="utf-8")
         removed += n
     return removed
+
+
+def _validate_xml(epub_dir: Path) -> tuple[int, int]:
+    """Refuse to ship an EPUB whose documents the translator cannot parse.
+
+    translate_book.py parses with xml.etree, which is stricter than most EPUB
+    readers and gives up on the first malformed document — as a run that died at
+    0% after pandoc emitted a valueless attribute showed. So every XHTML, OPF
+    and NCX is parsed here: with lxml first (the clearer error message), then
+    with xml.etree, the parser that actually has to cope. A file only xml.etree
+    rejects is rewritten from the lxml tree; one that neither can read aborts
+    the conversion, naming the file.
+    """
+    checked = rewritten = 0
+    for path in sorted(
+        p for pattern in ("*.xhtml", "*.opf", "*.ncx")
+        for p in epub_dir.rglob(pattern)
+    ):
+        checked += 1
+        data = path.read_bytes()
+        try:
+            tree = etree.fromstring(data)
+        except etree.XMLSyntaxError as err:
+            sys.exit(
+                f"error: {path.relative_to(epub_dir)} is not well-formed XML "
+                f"and would break the translator:\n  {err}"
+            )
+        try:
+            ElementTree.fromstring(data)
+            continue
+        except ElementTree.ParseError as err:
+            print(f"      rewriting {path.relative_to(epub_dir)} ({err})", flush=True)
+        path.write_bytes(
+            etree.tostring(tree, encoding="utf-8", xml_declaration=True)
+        )
+        rewritten += 1
+        try:
+            ElementTree.fromstring(path.read_bytes())
+        except ElementTree.ParseError as err:
+            sys.exit(
+                f"error: {path.relative_to(epub_dir)} still does not parse after "
+                f"rewriting:\n  {err}"
+            )
+    return checked, rewritten
 
 
 # Section titles that mark the bibliography. Matched case-insensitively after
@@ -317,9 +510,9 @@ def _register_in_opf(epub_dir: Path, ref_path: Path, idref: str) -> None:
 def _split_references(epub_dir: Path) -> str:
     """Move the References/Bibliography section into its own spine document.
 
-    pdf_craft + pandoc emit the whole paper as one flat xhtml, so there is no
-    separate spine item the translator's `exclude_spine_ids` can reach. To keep
-    the bibliography in the final book but out of translation, we split it into a
+    pandoc emits the whole paper as one flat xhtml, so there is no separate
+    spine item the translator's `exclude_spine_ids` can reach. To keep the
+    bibliography in the final book but out of translation, we split it into a
     `references.xhtml` document and register it in the OPF; the translator then
     excludes it by idref (see translate_book.yaml) while it stays in the output.
 
@@ -395,19 +588,60 @@ def _check_pandoc() -> None:
         )
 
 
+def _ocr(
+    pdf_path: Path,
+    md_path: Path,
+    assets_path: Path,
+    work_dir: Path,
+    server_url: str | None,
+) -> None:
+    """Step 1: OCR the PDF, starting and stopping our own server if needed."""
+    if server_url:
+        if not _server_healthy(server_url):
+            sys.exit(
+                f"error: no PaddleOCR-VL inference server at {server_url}.\n"
+                "Drop --server-url to have this script start one itself."
+            )
+        print(f"      using the server already running at {server_url}", flush=True)
+        _run_paddle(pdf_path, md_path, assets_path, server_url)
+        return
+
+    if _server_healthy(PADDLE_SERVER_URL):
+        sys.exit(
+            f"error: something is already listening at {PADDLE_SERVER_URL}.\n"
+            f"Pass --server-url {PADDLE_SERVER_URL} to use it, or stop it first."
+        )
+    server = PaddleServer(work_dir, _gpu_utilisation_budget())
+
+    def bail(signum, _frame):  # noqa: ANN001 - signal handler signature
+        server.stop()
+        sys.exit(128 + signum)
+
+    installed = [(sig, signal.signal(sig, bail))
+                 for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)]
+    try:
+        server.wait_ready(PADDLE_SERVER_URL)
+        _run_paddle(pdf_path, md_path, assets_path, PADDLE_SERVER_URL)
+    finally:
+        for sig, handler in installed:
+            signal.signal(sig, handler)
+        server.stop()
+
+
 def convert(
     pdf_path: Path,
     epub_path: Path,
-    ocr_size: str = DEFAULT_OCR_SIZE,
-    engine: str = DEFAULT_ENGINE,
-    vl_backend: str | None = PADDLE_VL_BACKEND,
-    server_url: str | None = PADDLE_SERVER_URL,
+    server_url: str | None = None,
     work_dir: Path | None = None,
     keep_work: bool = False,
     title: str | None = None,
     split_references: bool = False,
 ) -> Path:
-    """Run the full PDF -> clean EPUB pipeline. Returns the EPUB path."""
+    """Run the full PDF -> clean EPUB pipeline. Returns the EPUB path.
+
+    `server_url` names an inference server that is already running; without one
+    we start a server for this conversion and stop it before returning.
+    """
     _check_pandoc()
     pdf_path = pdf_path.resolve()
     epub_path = epub_path.resolve()
@@ -420,44 +654,23 @@ def convert(
 
     md_path = work_dir / "book.md"
     assets_path = work_dir / "assets"
-    analysing_path = work_dir / "_ocr"
 
     # 1. OCR -> Markdown
     t0 = time.time()
-    if engine == "paddle":
-        print(f"[1/6] OCR {pdf_path.name} -> markdown (PaddleOCR-VL) ...", flush=True)
-        _run_paddle(pdf_path, md_path, assets_path, vl_backend, server_url)
-    else:
-        print(
-            f"[1/6] OCR {pdf_path.name} -> markdown (DeepSeek-OCR, ocr_size={ocr_size}) ...",
-            flush=True,
-        )
-        from pdf_craft import transform_markdown
-
-        transform_markdown(
-            pdf_path=str(pdf_path),
-            markdown_path=str(md_path),
-            markdown_assets_path=str(assets_path),
-            analysing_path=str(analysing_path),
-            models_cache_path=MODELS_CACHE,
-            ocr_size=ocr_size,
-            includes_footnotes=True,
-        )
+    print(f"[1/7] OCR {pdf_path.name} -> markdown (PaddleOCR-VL) ...", flush=True)
+    _ocr(pdf_path, md_path, assets_path, work_dir, server_url)
     print(f"      OCR done in {time.time() - t0:.1f}s", flush=True)
 
-    # 2. fix LaTeX over-escaping  3. absolutize image paths
+    # 2. escape stray angle brackets  3. absolutize image paths
     text = md_path.read_text(encoding="utf-8")
-    if engine == "deepseek":
-        print("[2/6] fixing LaTeX escaping", flush=True)
-        text = _de_escape_latex(text)
-    else:
-        print("[2/6] LaTeX escaping: not needed (PaddleOCR-VL emits plain LaTeX)", flush=True)
-    print("[3/6] resolving image paths", flush=True)
+    text, escaped = _escape_stray_tags(text)
+    print(f"[2/7] escaped {escaped} non-HTML <tag> sequence(s)", flush=True)
+    print("[3/7] resolving image paths", flush=True)
     text = _absolutize_images(text, md_path.parent)
     md_path.write_text(text, encoding="utf-8")
 
     # 4. pandoc -> EPUB with MathML
-    print("[4/6] pandoc -> EPUB (MathML)", flush=True)
+    print("[4/7] pandoc -> EPUB (MathML)", flush=True)
     raw_epub = work_dir / "raw.epub"
     cmd = [
         "pandoc", str(md_path), "-o", str(raw_epub),
@@ -468,8 +681,8 @@ def convert(
     if result.returncode != 0:
         sys.exit(f"pandoc failed:\n{result.stderr}")
 
-    # 5. strip annotations  6. repackage
-    print("[5/6] stripping LaTeX annotation duplicates", flush=True)
+    # 5. strip annotations  6. validate  7. repackage
+    print("[5/7] stripping LaTeX annotation duplicates", flush=True)
     epub_extract = work_dir / "epub"
     if epub_extract.exists():
         shutil.rmtree(epub_extract)
@@ -480,10 +693,14 @@ def convert(
     print(f"      removed {removed} annotation(s)", flush=True)
 
     if split_references:
-        print("[5b/6] splitting off References section", flush=True)
+        print("[5b/7] splitting off References section", flush=True)
         print(f"      {_split_references(epub_extract)}", flush=True)
 
-    print("[6/6] repackaging EPUB", flush=True)
+    print("[6/7] validating XML", flush=True)
+    checked, rewritten = _validate_xml(epub_extract)
+    print(f"      {checked} document(s) parse, {rewritten} rewritten", flush=True)
+
+    print("[7/7] repackaging EPUB", flush=True)
     _repackage_epub(epub_extract, epub_path)
 
     if not keep_work:
@@ -503,27 +720,11 @@ def main(argv: list[str] | None = None) -> None:
         help="output EPUB path (default: output/<pdf-stem>.epub)",
     )
     p.add_argument(
-        "--engine", default=DEFAULT_ENGINE, choices=["deepseek", "paddle"],
-        help="OCR engine (default: paddle = PaddleOCR-VL 1.6 in its own "
-             ".venv-paddle venv, which needs a running genai_server). "
-             "deepseek runs DeepSeek-OCR through pdf_craft and needs no server, "
-             "at roughly 6x the time per page.",
-    )
-    p.add_argument(
-        "--ocr-size", default=DEFAULT_OCR_SIZE,
-        choices=["tiny", "small", "base", "large", "gundam"],
-        help="DeepSeek-OCR resolution tier (default: base); ignored by --engine paddle",
-    )
-    p.add_argument(
-        "--vl-backend", default=PADDLE_VL_BACKEND,
-        help=f"--engine paddle only: VL recognition backend (default: "
-             f"{PADDLE_VL_BACKEND}). Pass an empty string to recognise "
-             "in-process instead, which is minutes per page.",
-    )
-    p.add_argument(
-        "--server-url", default=PADDLE_SERVER_URL,
-        help=f"--engine paddle only: endpoint of that server "
-             f"(default: {PADDLE_SERVER_URL})",
+        "--server-url", default=None,
+        help="endpoint of a PaddleOCR-VL inference server that is already "
+             f"running, e.g. {PADDLE_SERVER_URL}. Omit it and this script "
+             f"starts a server on port {PADDLE_SERVER_PORT} for the conversion "
+             "and stops it afterwards.",
     )
     p.add_argument(
         "--keep-work", action="store_true",
@@ -545,9 +746,6 @@ def main(argv: list[str] | None = None) -> None:
     convert(
         pdf_path=args.pdf,
         epub_path=epub_path,
-        ocr_size=args.ocr_size,
-        engine=args.engine,
-        vl_backend=args.vl_backend,
         server_url=args.server_url,
         keep_work=args.keep_work,
         split_references=args.split_references,
@@ -556,5 +754,3 @@ def main(argv: list[str] | None = None) -> None:
 
 if __name__ == "__main__":
     main()
-
-
