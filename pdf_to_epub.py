@@ -70,12 +70,17 @@ VLLM_CONFIG = HERE / "vllm_12gb.yaml"
 SERVER_READY_TIMEOUT = 600
 
 # VRAM the OCR *client* needs beside the server: PaddleOCR-VL's layout detector
-# plus paddle's allocator and the page bitmaps. Measured peak on this repo's
-# test pages is ~2.6 GB (scanned pages are the worst case), so we hold back
-# 3 GB. Do not lower this to the ~1.5 GB the layout weights suggest: leaving
-# only 2.7 GB for the client is exactly the OOM we hit at
-# gpu-memory-utilization 0.62 with a 1.3 GB desktop on the card.
-CLIENT_RESERVE_MIB = 3072
+# plus paddle's allocator and the page bitmaps, which is where the page size
+# lands. A4 at the engine's own 200 dpi is the largest page we have run, and
+# nvidia-smi's per-process figure for the client peaks at 3.6 GB on it, against
+# the ~2.6 GB of the small US-letter test pages this reserve was first set from
+# (see the README). 3 GB was therefore too little: on a 92-page A4 paper the
+# budget came out at 0.60 and the client died with "Cannot allocate 366 MB ...
+# 11.33 GB has been allocated". 4.5 GB is the measured peak plus room for the
+# desktop to move, and on a 12 GB card it reproduces the 0.50 that ran the
+# paper through by hand. Do not lower it to the ~1.5 GB the layout weights
+# suggest.
+CLIENT_RESERVE_MIB = 4608
 
 # Below this the server has no room left for a KV cache worth having, so we
 # stop rather than start something that will die during profiling.
