@@ -23,6 +23,13 @@ this is required, and required again after every `uv sync`):
 uv run python apply_patches.py
 ```
 
+The tests cover the pure text passes (the markdown repair in `pdf_to_epub.py`),
+and need no GPU:
+
+```bash
+uv run pytest
+```
+
 ### Local dependency patches
 
 `epub-translator` ships two bugs that are fatal for a book-length run, plus one
@@ -356,30 +363,74 @@ spare and still gives a 280k-token KV cache.
 a fraction of *total* VRAM and refuses to start unless that much is *free*
 (`v1/worker/gpu_worker.py`), so any fixed value is wrong as soon as the
 desktop's own usage moves — the 0.62 this repo used to ship dies with a browser
-open. `pdf_to_epub.py` reads free VRAM from `nvidia-smi`, holds back 3 GB for
+open. `pdf_to_epub.py` reads free VRAM from `nvidia-smi`, holds back 4.5 GB for
 the OCR client, and rounds what is left down to a multiple of 0.05. Below 0.35
 it refuses to start instead of launching something that will die during
 profiling.
 
-The 3 GB reserve is the OCR client's measured worst case (a scanned page peaked
-~2.6 GB above the server), not the ~1.5 GB the layout weights suggest. Leaving
-only 2.7 GB is exactly the OOM we hit at 0.62 with a 1.3 GB desktop.
+**The 4.5 GB reserve is a measurement, and page size is what it measures.** The
+client holds PaddleOCR-VL's layout detector, paddle's allocator and the page
+bitmaps, so a bigger page costs more; the reserve used to be 3 GB, taken from
+this repo's small US-letter test pages. A4 does not fit in that. On the 92-page
+A4 paper the computed budget came out at 0.60 and the client died with `Cannot
+allocate 366.210938MB memory on GPU 0, 11.332764GB memory has been allocated`.
 
-Measured on an RTX 3060 12 GB with the desktop holding ~1.3 GB, which put the
-computed budget at 0.60:
+How to measure it again, for a page size not tried here: sample the per-process
+figure while a conversion runs, rather than the card total, because the total
+cannot tell the client apart from the server.
+
+```bash
+while :; do nvidia-smi --query-compute-apps=pid,used_memory \
+    --format=csv,noheader; sleep 3; done
+```
+
+Two compute processes show up. The vLLM server is the one that starts first and
+grows towards its budget; the client is the other one, and on A4 at the engine's
+own 200 dpi it sits at **3952 MiB** for the whole run — paddle's allocator does
+not give memory back, so the steady state is the peak. 4.5 GB is that plus room
+for the desktop to move, and on a 12 GB card it lands on the 0.50 that ran this
+paper through end to end.
+
+Measured on an RTX 3060 12 GB with the desktop holding ~1.3 GB. The two short
+page sets ran under the old 3 GB reserve, at a computed budget of 0.60; the
+paper ran at 0.50, which is what 4.5 GB leaves on this card.
 
 | page set | wall time | peak VRAM |
 | --- | --- | --- |
 | 3 two-column pages with figures and a BNF grammar (`07-contract-net` p7-9) | 46 s, of which 28 s is the server starting | 9876 MiB |
 | 1 page, 3x3 matrix product (`airobotics_p34`) | 40 s, of which 28 s is the server starting | 8889 MiB |
+| 92 A4 pages, math throughout, 10 algorithms (arXiv 2608.25512) | 196 s to the finished EPUB, of which 194 s is OCR and 28 s of that the server starting | 11068 MiB: server 5950, client 3952, desktop the rest |
 
-OCR itself is ~4 s per page; the rest of each figure above is the server coming
-up and ~2 s for the layout model in the client.
+OCR itself is 1.8-4 s per page, the larger figure on short runs where the ~2 s
+layout-model load in the client still counts; the rest of each figure above is
+the server coming up.
 
 ### What the pipeline does, and the gotchas it handles
 
 1. **OCR -> Markdown**, PaddleOCR-VL 1.6 in a subprocess against the server.
-2. **Escapes angle brackets that are text.** The Contract Net paper prints its
+2. **Repairs the markdown the engine wrote**, in three ways, each of which cost
+   whole pages on the first long paper that went through here (arXiv 2608.25512,
+   92 A4 pages).
+   * An **unterminated `\[`** is closed at the end of its paragraph. pandoc's
+     math parser runs to the next closer wherever that is, so one dropped `\]`
+     pulled 6725 characters — prose, a figure and 54 inline formulas — into a
+     single unrenderable span. An odd number of `$$` in a paragraph is the same
+     fault in the other delimiter.
+   * **`$ x $` is tightened to `$x$`.** pandoc's `tex_math_dollars` rejects a
+     space just inside the delimiters, and `markdown+raw_tex` then reads the
+     command inside as raw inline TeX and drops it from the HTML, so
+     `$ \Gamma_n $` reaches the reader as `$ _n $`. The engine pads both sides
+     on this paper 1218 times; tightening them took it from 764 `<math>`
+     elements to 1974.
+   * **Algorithm listings are fenced.** The engine writes one step per markdown
+     line with no fence, so markdown joins an 18-line algorithm into one run-on
+     sentence and `mask_code` in the translator — which protects only what is
+     marked up as code — has nothing to work with. An `Algorithm N Title`
+     caption is signal enough to fence the short lines that follow it, blank
+     lines dropped, which also rejoins a listing split across a page break;
+     with no caption, four fifths of at least four consecutive short lines must
+     read as a step. 10 blocks on this paper, no prose caught.
+3. **Escapes angle brackets that are text.** The Contract Net paper prints its
    message grammar as `<message> => <header> <addressee> ...`. pandoc passes raw
    HTML through, so the EPUB ends up with an unclosed `<header>` and stops being
    well-formed XHTML. A bare tag the document never closes becomes literal text;
@@ -387,24 +438,24 @@ up and ~2 s for the layout model in the client.
    PaddleOCR-VL escapes such names itself on some pages and not others, which is
    why this cannot be left to the engine — on `07-contract-net` p7-9 it emitted
    33 of them unescaped.
-3. **Resolves image paths.** The engine writes `imgs/<name>` while the images
+4. **Resolves image paths.** The engine writes `imgs/<name>` while the images
    land flat in the work directory, so pandoc cannot embed them; we rewrite to
    absolute paths. Both syntaxes are covered: `![](path)` and the
    `<img src="imgs/…">` inside a centring `<div>` that the engine emits for a
    scaled figure.
-4. **pandoc `--mathml`** converts the `$…$` LaTeX to MathML. pandoc's matrix
+5. **pandoc `--mathml`** converts the `$…$` LaTeX to MathML. pandoc's matrix
    handling is correct where the OCR engines' own renderers flattened or dropped
    matrices.
-5. **Strips `<annotation>` duplicates.** pandoc embeds a raw-LaTeX annotation
+6. **Strips `<annotation>` duplicates.** pandoc embeds a raw-LaTeX annotation
    next to each formula; readers without full `<semantics>` support print it as
    body text, doubling every formula.
-6. **Parses every XHTML, OPF and NCX** with lxml and with `xml.etree`. The
+7. **Parses every XHTML, OPF and NCX** with lxml and with `xml.etree`. The
    translator uses `xml.etree`, which is stricter than most EPUB readers and
    gives up on the first bad document — a run once died at 0% because pandoc had
    written a valueless attribute. A file only `xml.etree` rejects is rewritten
    from the lxml tree; one neither can read aborts the conversion by name,
    rather than shipping an EPUB that breaks translation later.
-7. **Repackages** the EPUB with `mimetype` stored first, per spec.
+8. **Repackages** the EPUB with `mimetype` stored first, per spec.
 
 ### Known weak spots
 
@@ -415,9 +466,23 @@ up and ~2 s for the layout model in the client.
 * **Figure captions on magazine layouts** can come out as a heading as well as
   a caption, which then shows up in the generated TOC.
 * **Scanned pages** cost about one substitution per 200 words.
-* **Code blocks** come through as prose more often than as fenced code, so a
-  book full of listings needs a hand-check; `mask_code` in the translator only
-  protects what is marked up as code.
+* **Code blocks** come through as prose unless they are algorithm listings,
+  which step 2 above fences. A book full of listings in another shape still
+  needs a hand-check; `mask_code` in the translator only protects what is marked
+  up as code.
+* **A term the engine thinks it knows is silently corrected.** On 2608.25512 it
+  read "coeffect" as "coefficient" 99 times, headings included, while leaving
+  125 other occurrences alone — so the paper's central concept reads as a number
+  in a third of the places it appears, and a glossary built from that text would
+  carry the wrong word into the translation. Nothing in the markdown marks these
+  apart from a real coefficient; a `sed` over the output before translating is
+  the only fix, and it needs the word list of the particular paper.
+* **A display formula whose braces come out unbalanced stays raw LaTeX.** 11 of
+  them on that paper, all `\begin{array}` markup from multi-line braced
+  equations. pandoc leaves what it cannot parse as text, which is the honest
+  outcome, but the reader sees `\left(\begin{array}{c}...` in the body.
+* **Theorem and figure captions can become headings**, which puts them in the
+  generated TOC alongside the real sections.
 
 ### PaddleOCR-VL replaced DeepSeek-OCR on 2026-09-12
 
@@ -594,7 +659,8 @@ deterministic.
 
 ### The embedded font
 
-The subset is built with fontTools at run time from
+The subset is built with fontTools (a plain dependency, so `uv sync` has it)
+at run time from
 `/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc` **font number 2**
 (Noto Sans CJK **SC** — index 0 is the JP face, whose glyph forms are wrong for
 Chinese body text). Noto is OFL-licensed, so embedding and redistributing a

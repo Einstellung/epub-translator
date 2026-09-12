@@ -72,7 +72,7 @@ SERVER_READY_TIMEOUT = 600
 # VRAM the OCR *client* needs beside the server: PaddleOCR-VL's layout detector
 # plus paddle's allocator and the page bitmaps, which is where the page size
 # lands. A4 at the engine's own 200 dpi is the largest page we have run, and
-# nvidia-smi's per-process figure for the client peaks at 3.6 GB on it, against
+# nvidia-smi's per-process figure for the client sits at 3952 MiB on it, against
 # the ~2.6 GB of the small US-letter test pages this reserve was first set from
 # (see the README). 3 GB was therefore too little: on a 92-page A4 paper the
 # budget came out at 0.60 and the client died with "Cannot allocate 366 MB ...
