@@ -7,6 +7,9 @@ readme = "README.md"
 requires-python = ">=3.12,<3.13"
 dependencies = [
     "epub-translator>=0.1.10",
+    # polish_cjk.py subsets the embedded CJK face with it, and refuses to run
+    # without one, so it is a plain dependency and not an extra.
+    "fonttools>=4.60.1",
     "lxml>=6.1.1",
     "python-dotenv>=1.2.2",
     # 6.0.2 exactly is what paddlex pins; we only need >=6.0.
@@ -66,3 +69,12 @@ override-dependencies = [
     "nvidia-nvjitlink-cu12==12.8.93",
     "nvidia-nvtx-cu12==12.8.90",
 ]
+
+
+[dependency-groups]
+dev = ["pytest>=8.4.2"]
+
+# The modules sit at the repository root, so the tests import them from there.
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
