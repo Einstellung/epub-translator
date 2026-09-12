@@ -12,8 +12,8 @@ workaround encodes a bug we actually hit):
      line and column breaks.
   2. escape stray angle brackets   -> a BNF grammar printed as <message> =>
      <header> reaches pandoc as raw HTML and lands in the EPUB as an unclosed
-     <header> element, i.e. invalid XHTML. Names that are not HTML elements are
-     escaped back into text first.
+     <header> element, i.e. invalid XHTML. A bare tag the document never closes
+     becomes text; a void tag is self-closed, since raw <br> is not XHTML either.
   3. rewrite image paths to absolute -> the engine's relative asset paths do
      not line up with where the files actually land, so pandoc can't embed
      them. Absolute paths fix it.
@@ -76,10 +76,9 @@ CLIENT_RESERVE_MIB = 3072
 # stop rather than start something that will die during profiling.
 MIN_GPU_UTILISATION = 0.35
 
-# HTML element names. Anything else inside <...> in the OCR markdown is text
-# that happens to look like a tag (BNF non-terminals, <EOF>, <name>), and has
-# to be escaped before pandoc treats it as raw HTML. MathML and SVG names are
-# included because pandoc's own math output uses them.
+# HTML element names, for telling markup apart from text that looks like it.
+# Being on this list is not enough on its own: a BNF grammar happily prints
+# <header> and <text>, which are elements. See _escape_stray_tags.
 _HTML_ELEMENTS = frozenset(
     """a abbr address area article aside audio b base bdi bdo blockquote body br
     button canvas caption cite code col colgroup data datalist dd del details
@@ -94,6 +93,12 @@ _HTML_ELEMENTS = frozenset(
     mover munderover mmultiscripts mtable mtr mtd mtext merror mpadded mphantom
     mstyle menclose semantics annotation
     svg g path circle ellipse line polyline polygon rect text tspan defs use
+    """.split()
+)
+
+# Elements that never have a closing tag, so a lone <br> is still markup.
+_VOID_ELEMENTS = frozenset(
+    """area base br col embed hr img input link meta param source track wbr
     """.split()
 )
 
@@ -267,28 +272,50 @@ def _run_paddle(
         sys.exit(f"PaddleOCR-VL failed (exit {result.returncode})")
 
 
-def _escape_stray_tags(text: str) -> tuple[str, int]:
-    """Escape <word> sequences that are not HTML elements, outside code.
+def _escape_stray_tags(text: str) -> tuple[str, int, int]:
+    """Escape bare <word> sequences that are text, not markup, outside code.
 
     The Contract Net paper prints its message grammar as `<message> => <header>
-    <addressee> ...`. pandoc reads those as raw HTML, so the EPUB gets an
+    <addressee> <text> ...`. pandoc reads those as raw HTML, so the EPUB gets an
     unclosed <header> and stops being well-formed XHTML; the translator then
     fails on that file. PaddleOCR-VL escapes such names itself on some pages and
-    not others, so we normalise: a name that is not an HTML element becomes
-    literal text.
+    not others, so we normalise.
+
+    A name being an HTML element is not enough to keep it — half a BNF grammar
+    is element names. A bare tag counts as markup only if it is a void element
+    (a lone <br> is real) or if the document pairs it: an opening tag somewhere
+    and a matching `</name>`. PaddleOCR-VL closes what it opens and writes its
+    <div>/<img> with attributes, which this leaves alone; a non-terminal has no
+    closing tag anywhere, so it becomes literal text.
+
+    A void tag is kept but self-closed, because pandoc passes raw HTML through
+    verbatim and `<br>` on its own is not well-formed XHTML either.
 
     Code is left alone (a backslash inside a code span would be printed), and so
-    is anything the engine already escaped.
+    is anything the engine already escaped. Returns (text, escaped, self-closed).
     """
+    opened = {m.group(1).lower()
+              for m in re.finditer(r"<([A-Za-z][A-Za-z0-9._:-]*)(?=[\s/>])", text)}
+    closed = {m.group(1).lower()
+              for m in re.finditer(r"</([A-Za-z][A-Za-z0-9._:-]*)\s*>", text)}
+
     pattern = re.compile(r"(?<!\\)<(/?)([A-Za-z][A-Za-z0-9._:-]*)>")
-    escaped = 0
+    escaped = closed_up = 0
 
     def sub(m: re.Match) -> str:
-        nonlocal escaped
-        if m.group(2).lower() in _HTML_ELEMENTS:
-            return m.group(0)
+        nonlocal escaped, closed_up
+        slash, name = m.group(1), m.group(2)
+        key = name.lower()
+        if key in _HTML_ELEMENTS:
+            if key in _VOID_ELEMENTS:
+                if slash:
+                    return m.group(0)
+                closed_up += 1
+                return f"<{name}/>"
+            if key in opened and key in closed:
+                return m.group(0)
         escaped += 1
-        return f"\\<{m.group(1)}{m.group(2)}\\>"
+        return f"\\<{slash}{name}\\>"
 
     out: list[str] = []
     fence: str | None = None
@@ -309,7 +336,7 @@ def _escape_stray_tags(text: str) -> tuple[str, int]:
             part if i % 2 else pattern.sub(sub, part)
             for i, part in enumerate(parts)
         ))
-    return "".join(out), escaped
+    return "".join(out), escaped, closed_up
 
 
 def _resolve_asset(rel: str, md_dir: Path) -> Path | None:
@@ -663,8 +690,9 @@ def convert(
 
     # 2. escape stray angle brackets  3. absolutize image paths
     text = md_path.read_text(encoding="utf-8")
-    text, escaped = _escape_stray_tags(text)
-    print(f"[2/7] escaped {escaped} non-HTML <tag> sequence(s)", flush=True)
+    text, escaped, closed_up = _escape_stray_tags(text)
+    print(f"[2/7] escaped {escaped} <tag> sequence(s) that are text, "
+          f"self-closed {closed_up} void tag(s)", flush=True)
     print("[3/7] resolving image paths", flush=True)
     text = _absolutize_images(text, md_path.parent)
     md_path.write_text(text, encoding="utf-8")
