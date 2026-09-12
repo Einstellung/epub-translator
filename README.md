@@ -267,83 +267,165 @@ uv run python glossary.py "input/My Book.epub" --min-freq 2
 ## PDF to EPUB (math-aware)
 
 Have a PDF instead of an EPUB? Convert it first, then feed the EPUB into the
-translator above. Layout, text and formula recognition run through PaddleOCR-VL
-1.6 by default, with DeepSeek-OCR available as `--engine deepseek`; `pandoc`
-turns the result into a clean, math-correct EPUB. The default engine needs an
-inference server running first — see
-[OCR engines](#ocr-engines---engine-paddle-default-and---engine-deepseek).
+translator above. Layout, text and formula recognition run through
+**PaddleOCR-VL 1.6** against a local vLLM inference server, and `pandoc` turns
+the result into a clean, math-correct EPUB. The script starts the server, waits
+for it, and kills it when the conversion is done, so there is nothing to leave
+running:
 
 ```bash
-# start the PaddleOCR-VL server once, leave it running (~7 GB of VRAM)
-VIRTUAL_ENV=.venv-paddle .venv-paddle/bin/paddleocr genai_server \
-    --model_name PaddleOCR-VL-1.6-0.9B --backend vllm --port 8118 \
-    --backend_config vllm_12gb.yaml
-
-uv run python pdf_to_epub.py input/book.pdf                 # -> output/book.epub
-uv run python pdf_to_epub.py input/paper.pdf --split-references   # 论文：拆出参考文献
-uv run python pdf_to_epub.py input/book.pdf --engine deepseek --ocr-size base
+uv run python pdf_to_epub.py input/book.pdf                    # -> output/book.epub
+uv run python pdf_to_epub.py input/paper.pdf --split-references
+uv run python pdf_to_epub.py input/book.pdf --server-url http://localhost:8118/v1
 ```
 
-**论文场景加 `--split-references`**：把 References/Bibliography 段拆成独立的
-`references.xhtml`，登记进 OPF 的 manifest 和 spine（idref 为 `references`）。学术 PDF 转出的
-EPUB 是单文件（整篇一个 `ch001.xhtml`），拆开后书目才有独立 spine id，翻译器就能用
-`exclude_spine_ids` 把它排除在翻译外、又保留在成品里（`translate_book.yaml` 默认已排除
-`references`）。带体量自检：万一误判标题会保留原样、不动正文。标题识别 References /
-Bibliography / 参考文献（忽略大小写与前导编号）。旧的 `--strip-references` 作为别名保留。
+Converting several PDFs in a row? Start one server by hand (command below) and
+pass `--server-url`, so the ~30 s of model loading is paid once. With
+`--server-url` the script never starts or stops anything: if nothing answers at
+that endpoint it says so and exits.
+
+Add `--split-references` for papers. It moves the References/Bibliography
+section into its own `references.xhtml` and registers it in the OPF manifest and
+spine with idref `references`. An academic PDF converts to a single-document
+EPUB (the whole paper as one `ch001.xhtml`), so without the split there is no
+spine id for the translator's `exclude_spine_ids` to name; with it the
+bibliography stays in the book and out of translation (`translate_book.yaml`
+already excludes `references`). A size check keeps everything in place if the
+heading was mis-detected, so it cannot empty the body. Headings recognised:
+References / Bibliography / 参考文献, case-insensitive, leading numbering
+ignored. `--strip-references` is kept as an alias.
 
 Requirements: `pandoc` on PATH (`sudo apt install pandoc`) and an NVIDIA GPU.
-PaddleOCR-VL's models (~2 GB) download once into `~/.paddlex/official_models`;
-DeepSeek-OCR (~6.3 GB) downloads once into `models/`. Both are reused.
+PaddleOCR-VL's models (~2 GB) download once into `~/.paddlex/official_models`
+and are reused.
 
-What the pipeline does, and the gotchas it handles automatically:
+### Installing the OCR engine
 
-1. **OCR -> Markdown**, PaddleOCR-VL by default. Prose, matrices and inline
-   math come out well on both engines; on DeepSeek-OCR **code blocks are the
-   weak spot** — structure and identifiers get mangled, so hand-check any code
-   after conversion.
-2. **Fixes LaTeX over-escaping** — pdf_craft doubles every command backslash
-   inside math (`\\cos` -> `\cos`) while preserving real `\\` matrix row-breaks.
-3. **Resolves image paths** — pdf_craft's relative asset paths don't line up
-   with where files land, so pandoc can't embed them; we rewrite to absolute.
-4. **pandoc `--mathml`** — converts the now-valid LaTeX to MathML. pandoc's
-   matrix handling is correct where pdf_craft's own renderers flattened or
-   dropped matrices.
-5. **Strips `<annotation>` duplicates** — pandoc embeds a raw-LaTeX annotation
-   next to each formula; some readers print it as body text, doubling every
-   formula. We remove them.
-6. **Repackages** the EPUB with `mimetype` stored first, per spec.
-
-DeepSeek-OCR resolution tiers (`--ocr-size`, ignored by the default engine):
-`tiny`/`small`/`base`/`large` send the whole page as one image
-(512/640/1024/1280 px); `gundam` crops dense pages into tiles. **`base`** is the
-default — best quality/VRAM trade-off for normal books (peak ~8.6 GB on a 12 GB
-card). Use `gundam` for dense, small-font or scanned pages; it recognises more
-but costs more VRAM and time.
-
-### OCR engines: `--engine paddle` (default) and `--engine deepseek`
-
-`--engine paddle` runs **PaddleOCR-VL 1.6** (released 2026-05-28, ~1.0 B
-parameters, BF16) against a vLLM inference server you start yourself. It is the
-default because on the same pages it is 6-8x faster than DeepSeek-OCR and its
-markdown is at least as good.
-
-Start the server first and leave it running; it holds **~7.1 GB of VRAM** for
-as long as it is up, so nothing else should be on the card:
+`uv sync` is the whole install — the engine shares the project venv:
 
 ```bash
-VIRTUAL_ENV=.venv-paddle .venv-paddle/bin/paddleocr genai_server \
-    --model_name PaddleOCR-VL-1.6-0.9B --backend vllm --port 8118 \
-    --backend_config vllm_12gb.yaml
+uv sync
+uv run python apply_patches.py    # required again after every sync
 ```
 
-`pdf_to_epub.py` checks `/health` before it starts and exits with this command
-if nothing answers, rather than falling back to in-process recognition — that
-path took over 300 s for a single page here (GPU idle, one CPU core pinned),
-slow enough to look like a hang. Point `--server-url` elsewhere to use a server
-on another host or port, or pass `--engine deepseek` to work without one.
+Three things in `pyproject.toml` make that possible, and none of them is
+obvious:
 
-**Measured on an RTX 3060 12 GB**, same page sets, same machine, one engine at a
-time:
+* `paddlepaddle-gpu` exists only on Paddle's own index, declared as an
+  `explicit` uv index so nothing else is resolved against it. The `cu130` index
+  carries nightlies only, so we take the `cu126` stable wheel; it runs fine
+  against a CUDA 13.0 driver.
+* That wheel pins the CUDA 12.6 runtime wheels while `torch==2.8.0` pins 12.8,
+  so uv refuses the pair outright. `tool.uv.override-dependencies` forces the
+  12.8 set on both. That is not a guess: installing the two with `pip` one after
+  the other silently overwrote 12.6 with 12.8, and that is the state
+  PaddleOCR-VL has been running on all along. Bumping `torch` means re-reading
+  its pins and updating that list.
+* `flash-attn` comes from a prebuilt wheel URL (torch 2.8 / cp312 /
+  cxx11abiTRUE); building it from the sdist takes hours. It is not optional even
+  though vLLM ships its own kernels: paddlex's
+  `is_genai_engine_plugin_available` requires it on a CUDA box, and without it
+  the `genai_server` subcommand is not registered at all. The wheel's filename
+  version carries a local tag its own metadata does not, so uv considers the
+  installed copy stale and hardlinks it back on every `uv run` — one line of
+  noise per command, and nothing a version specifier can prevent.
+
+`paddleocr install_genai_server_deps vllm` is the documented way to install the
+serving backend and it does not work in a uv venv: it shells out to
+`python -m pip`, which is not there. The dependency list in `pyproject.toml` is
+what `paddlex.utils.deps.get_genai_dep_specs("vllm-server")` returns.
+
+### The inference server and its VRAM budget
+
+The server holds most of the card while it is up, so only one runs at a time.
+Start one by hand like this (the `--backend_config` is what `pdf_to_epub.py`
+writes for itself, plus a memory budget):
+
+```bash
+uv run paddleocr genai_server --model_name PaddleOCR-VL-1.6-0.9B \
+    --backend vllm --port 8118 --backend_config vllm_12gb.yaml
+```
+
+`vllm_12gb.yaml` holds only the knobs that are fixed. paddlex's own default of
+`max_num_batched_tokens=131072` does not fit a 12 GB card at all: the encoder
+cache alone leaves the KV cache at -0.36 GiB and the engine exits with "No
+available memory for the cache blocks". 16384 fits a page image with room to
+spare and still gives a 280k-token KV cache.
+
+`gpu-memory-utilization` is deliberately **not** in that file. vLLM reads it as
+a fraction of *total* VRAM and refuses to start unless that much is *free*
+(`v1/worker/gpu_worker.py`), so any fixed value is wrong as soon as the
+desktop's own usage moves — the 0.62 this repo used to ship dies with a browser
+open. `pdf_to_epub.py` reads free VRAM from `nvidia-smi`, holds back 3 GB for
+the OCR client, and rounds what is left down to a multiple of 0.05. Below 0.35
+it refuses to start instead of launching something that will die during
+profiling.
+
+The 3 GB reserve is the OCR client's measured worst case (a scanned page peaked
+~2.6 GB above the server), not the ~1.5 GB the layout weights suggest. Leaving
+only 2.7 GB is exactly the OOM we hit at 0.62 with a 1.3 GB desktop.
+
+Measured on an RTX 3060 12 GB with the desktop holding ~1.3 GB, which put the
+computed budget at 0.60:
+
+| page set | wall time | peak VRAM |
+| --- | --- | --- |
+| 3 two-column pages with figures and a BNF grammar (`07-contract-net` p7-9) | 46 s, of which 28 s is the server starting | 9876 MiB |
+| 1 page, 3x3 matrix product (`airobotics_p34`) | 40 s, of which 28 s is the server starting | 8889 MiB |
+
+OCR itself is ~4 s per page; the rest of each figure above is the server coming
+up and ~2 s for the layout model in the client.
+
+### What the pipeline does, and the gotchas it handles
+
+1. **OCR -> Markdown**, PaddleOCR-VL 1.6 in a subprocess against the server.
+2. **Escapes angle brackets that are text.** The Contract Net paper prints its
+   message grammar as `<message> => <header> <addressee> ...`. pandoc passes raw
+   HTML through, so the EPUB ends up with an unclosed `<header>` and stops being
+   well-formed XHTML. A bare tag the document never closes becomes literal text;
+   a void tag is kept but self-closed, because raw `<br>` is not XHTML either.
+   PaddleOCR-VL escapes such names itself on some pages and not others, which is
+   why this cannot be left to the engine — on `07-contract-net` p7-9 it emitted
+   33 of them unescaped.
+3. **Resolves image paths.** The engine writes `imgs/<name>` while the images
+   land flat in the work directory, so pandoc cannot embed them; we rewrite to
+   absolute paths. Both syntaxes are covered: `![](path)` and the
+   `<img src="imgs/…">` inside a centring `<div>` that the engine emits for a
+   scaled figure.
+4. **pandoc `--mathml`** converts the `$…$` LaTeX to MathML. pandoc's matrix
+   handling is correct where the OCR engines' own renderers flattened or dropped
+   matrices.
+5. **Strips `<annotation>` duplicates.** pandoc embeds a raw-LaTeX annotation
+   next to each formula; readers without full `<semantics>` support print it as
+   body text, doubling every formula.
+6. **Parses every XHTML, OPF and NCX** with lxml and with `xml.etree`. The
+   translator uses `xml.etree`, which is stricter than most EPUB readers and
+   gives up on the first bad document — a run once died at 0% because pandoc had
+   written a valueless attribute. A file only `xml.etree` rejects is rewritten
+   from the lxml tree; one neither can read aborts the conversion by name,
+   rather than shipping an EPUB that breaks translation later.
+7. **Repackages** the EPUB with `mimetype` stored first, per spec.
+
+### Known weak spots
+
+* **Hyphenation is rejoined, but not always cleanly.** The engine reassembles
+  words the typesetter broke across a line or column, and occasionally leaves
+  the tail of one as its own block (`tum.`) or substitutes a similar word
+  ("data." for "datum.").
+* **Figure captions on magazine layouts** can come out as a heading as well as
+  a caption, which then shows up in the generated TOC.
+* **Scanned pages** cost about one substitution per 200 words.
+* **Code blocks** come through as prose more often than as fenced code, so a
+  book full of listings needs a hand-check; `mask_code` in the translator only
+  protects what is marked up as code.
+
+### PaddleOCR-VL replaced DeepSeek-OCR on 2026-09-12
+
+`--engine deepseek`, which ran DeepSeek-OCR through `pdf_craft`, is gone, along
+with `--ocr-size`, the LaTeX de-escaping step it needed (`pdf_craft` doubled
+every command backslash inside math) and its 6.3 GB model cache in `models/`,
+which is safe to delete. The numbers that decided it, same page sets, same
+machine, one engine at a time on an RTX 3060 12 GB:
 
 | page set | PaddleOCR-VL 1.6 (vLLM) | DeepSeek-OCR (`base`) |
 | --- | --- | --- |
@@ -352,86 +434,19 @@ time:
 | 3 two-column pages with figures (`07-contract-net`) | 13 s — 4.3 s/page, peak 9941 MiB | 105 s — 35.0 s/page, peak 8606 MiB |
 | 1 page, 3x3 matrix product (`airobotics_p34`) | 13 s, peak 9041 MiB | 42 s, peak 8602 MiB |
 
-The PaddleOCR-VL peaks include the resident server, and every run pays ~3 s to
-load the layout model into the client process. So the engine is faster but
-hungrier: 10.3 GB of a 12 GB card at peak against DeepSeek-OCR's 8.6 GB.
+Quality, both engines' markdown read against the PDFs: PaddleOCR-VL rejoined
+hyphenated words where DeepSeek left them broken and inserted a stray period
+(`at the most "op- . portune" time`); it kept heading levels consistent where
+DeepSeek gave sibling sections different depths in the same paper; over a
+200-word sample of scanned text it made 1 substitution against DeepSeek's 6.
+Both followed two-column reading order and both reproduced the 3x3 matrix
+product in full. Upstream's numbers agree: OmniDocBench v1.5 puts
+PaddleOCR-VL-1.5 at 0.075 overall edit distance against DeepSeek-OCR-2 at 0.100,
+and the DeepSeek-OCR reachable through `pdf_craft` is the earlier v1.
 
-Quality, both engines' markdown read against the PDFs:
-
-* **Two-column reading order** — both follow the columns correctly. Paddle also
-  rejoins words the typesetter hyphenated across a line or column break ("so-"
-  + "lution"); DeepSeek leaves them broken and inserts a stray period
-  (`at the most "op- . portune" time`, `problem- . solving`). Paddle's own slip
-  is the mirror image: in `01-leases` it emitted the tail of one split word as
-  its own block (`tum.`) and wrote "data." where the text said "datum."
-* **Heading levels** — paddle is consistent: numbered sections at `##`,
-  subsections at `###`, sub-subsections at `####`. DeepSeek gives sibling
-  sections different depths in the same paper (`07-contract-net` has I. and
-  III. at `###` but II. and IV. at `##`). Both duplicate one figure caption as
-  a heading on the magazine-layout page.
-* **LaTeX formulas** — both reproduce the 3x3 rotation-matrix product in full,
-  and both reach the EPUB as 5 `<mtable>` / 15 `<mtr>` / 33 `<mtd>` with 0
-  leftover `<annotation>` and MathML in the default namespace. Paddle emits
-  plain `$…$` / `$$…$$` so step 2's de-escaping is skipped, and it kept the
-  Figure 1-5 caption that DeepSeek dropped.
-* **Scanned-page errors** — over a 200-word sample of `04-nii-blackboard`,
-  paddle made 1 substitution ("opportunities" for "opportune"), about 0.5%.
-  DeepSeek made 6: four hyphenations left broken, a footnote digit glued to the
-  sentence ("1976.1"), and a stray apostrophe. About 3%.
-
-Upstream's own numbers point the same way: 96.33% overall on OmniDocBench v1.6
-at release, and OmniDocBench v1.5 puts PaddleOCR-VL-1.5 at 0.075 overall edit
-distance against DeepSeek-OCR-2 at 0.100 (text 0.048, formula 0.198, table
-0.096, reading order 0.057). The DeepSeek-OCR we use through `pdf_craft` is the
-earlier v1.
-
-Installing the engine (it **cannot** share this project's venv — `paddlex` pins
-`pyyaml==6.0.2` and we need `pyyaml>=6.0.3`, so `uv` cannot resolve the two
-together; `pdf_to_epub.py` drives it as a subprocess, overridable with
-`PADDLE_PYTHON`):
-
-```bash
-uv venv --python 3.12 .venv-paddle
-VIRTUAL_ENV=.venv-paddle uv pip install paddlepaddle-gpu==3.3.1 \
-    --index https://www.paddlepaddle.org.cn/packages/stable/cu126/ \
-    --index-strategy unsafe-best-match
-VIRTUAL_ENV=.venv-paddle uv pip install 'paddleocr[doc-parser]'
-
-# the vLLM serving backend
-VIRTUAL_ENV=.venv-paddle uv pip install einops 'torch==2.8.0' \
-    'transformers<5.0.0' uvloop 'vllm==0.10.2' xformers
-VIRTUAL_ENV=.venv-paddle uv pip install --no-deps \
-    'https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.3/flash_attn-2.8.3+cu12torch2.8cxx11abiTRUE-cp312-cp312-linux_x86_64.whl'
-```
-
-The `cu130` index carries only nightly builds, so we pin the `cu126` stable
-wheel; it runs fine against a CUDA 13.0 driver.
-
-Three things about that backend install are not in the docs:
-
-* `paddleocr install_genai_server_deps vllm` is the documented command and it
-  shells out to `python -m pip`, which a `uv venv` does not have. Either
-  `uv pip install pip` first or install the specs directly as above — they are
-  exactly what `paddlex.utils.deps.get_genai_dep_specs("vllm-server")` returns.
-* `flash-attn` is not optional even though vLLM 0.10.2 ships its own attention
-  kernels: paddlex's `is_genai_engine_plugin_available` requires it on a CUDA
-  box, and without it the `genai_server` subcommand does not even register (it
-  is hidden from `paddleocr --help` either way, because argparse only lists
-  subcommands declared with a help string). Install the prebuilt wheel matching
-  torch 2.8 / cp312 / cxx11abiTRUE; building it from the sdist takes hours.
-* paddlex starts vLLM with `max_num_batched_tokens=131072`, whose encoder cache
-  alone leaves KV cache at **-0.36 GiB** on a 12 GB card and kills the engine
-  with "No available memory for the cache blocks". `vllm_12gb.yaml` in this repo
-  cuts it to 16384 and sets `gpu-memory-utilization: 0.62`, which leaves a
-  280k-token KV cache and ~4 GB for the layout model in the client process.
-
-Models (~2 GB) download to `~/.paddlex/official_models` on first use.
-
-`paddle_ocr.py` is the subprocess entry point. It emits the same shape as
-`pdf_craft.transform_markdown` — one markdown file plus an assets directory —
-so steps 3 to 6 of the pipeline, `--split-references` included, are shared by
-both engines. Step 3 resolves both syntaxes: pdf_craft writes `![](path)`,
-PaddleOCR-VL writes `<img src="imgs/…">` inside a centring `<div>`.
+So the engine that remains is faster and hungrier: 10.3 GB of a 12 GB card at
+peak against DeepSeek-OCR's 8.6 GB, and it needs a server where DeepSeek-OCR
+needed none. That is the trade the runtime VRAM budget above exists to manage.
 
 ### Translating a math EPUB: math is masked automatically
 
