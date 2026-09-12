@@ -1,0 +1,16 @@
+# vLLM backend settings for PaddleOCR-VL-1.6-0.9B on a 12 GB card.
+#
+# paddlex's own defaults do not fit: it passes max_num_batched_tokens=131072,
+# whose encoder cache alone leaves KV cache at -0.36 GiB and the engine exits
+# with "No available memory for the cache blocks". 16384 fits a page image with
+# room to spare and still gives a 280k-token KV cache.
+#
+#   VIRTUAL_ENV=.venv-paddle .venv-paddle/bin/paddleocr genai_server \
+#       --model_name PaddleOCR-VL-1.6-0.9B --backend vllm --port 8118 \
+#       --backend_config vllm_12gb.yaml
+#
+# Resident cost while it runs: ~7.1 GB of VRAM.
+gpu-memory-utilization: 0.62
+max-model-len: 16384
+max-num-batched-tokens: 16384
+max-num-seqs: 4

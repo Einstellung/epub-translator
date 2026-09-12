@@ -4,10 +4,11 @@ Pipeline (every step here was validated against real pages, and every
 workaround encodes a bug we actually hit):
 
   1. OCR -> Markdown + extracted image assets. Two engines:
-     --engine deepseek (default) runs DeepSeek-OCR through pdf_craft, which
-     reads prose and matrices well but mangles code blocks;
-     --engine paddle runs PaddleOCR-VL 1.6 out of its own venv (opt-in; its
-     serverless inference path is far too slow to be the default).
+     --engine paddle (default) runs PaddleOCR-VL 1.6 out of its own venv
+     against a vLLM server you start first: ~4 s per page, and it rejoins
+     words hyphenated across line and column breaks;
+     --engine deepseek runs DeepSeek-OCR through pdf_craft, needs no server,
+     takes ~6x longer per page and mangles code blocks.
   2. fix LaTeX over-escaping        -> DeepSeek path only: pdf_craft doubles
      every command backslash inside math spans (\\\\cos, \\\\begin). We restore
      \\\\<letter> to \\<letter> while preserving real \\\\ matrix row-breaks.
@@ -52,19 +53,25 @@ from lxml import etree
 DEFAULT_OCR_SIZE = "base"
 
 # pdf_craft caches OCR models here; reused across runs so we download once.
-MODELS_CACHE = "models"
+# Anchored to this file, not the working directory: run from elsewhere with a
+# relative path and pdf_craft silently re-downloads 6.3 GB into whatever
+# directory you happened to be in.
+MODELS_CACHE = str(Path(__file__).parent / "models")
 
-# PaddleOCR-VL is available with --engine paddle but is NOT the default: its
-# local (serverless) inference path is unusably slow on this hardware — over
-# 300 s for a single page against DeepSeek-OCR's 47 s, with the GPU idle and one
-# CPU core pinned. Upstream "strongly recommends" a vLLM/SGLang/FastDeploy
-# serving backend, which we have not validated. See the README.
-# It also cannot live in this project's venv: paddlex pins pyyaml==6.0.2 and we
-# need pyyaml>=6.0.3, so uv cannot resolve the two together. It gets its own
-# venv and we drive it as a subprocess.
-DEFAULT_ENGINE = "deepseek"
+# PaddleOCR-VL behind a vLLM server is the default: measured on the same pages,
+# 3.8-4.7 s per page against DeepSeek-OCR's 24-42 s, with equal or better
+# markdown (consistent heading levels, hyphenation rejoined across line and
+# column breaks, native $...$ LaTeX). It needs a server: PaddleOCR-VL's
+# in-process recognition path is minutes per page on this hardware, so
+# _require_paddle_server refuses to start rather than run in it by accident.
+# The engine cannot live in this project's venv either: paddlex pins
+# pyyaml==6.0.2 and we need pyyaml>=6.0.3, so uv cannot resolve the two
+# together. It gets its own venv and we drive it as a subprocess.
+DEFAULT_ENGINE = "paddle"
 PADDLE_VENV = Path(__file__).parent / ".venv-paddle"
 PADDLE_RUNNER = Path(__file__).parent / "paddle_ocr.py"
+PADDLE_VL_BACKEND = "vllm-server"
+PADDLE_SERVER_URL = "http://localhost:8118/v1"
 
 
 def _de_escape_latex(text: str) -> str:
@@ -105,50 +112,114 @@ def _paddle_python() -> str:
     return str(python)
 
 
-def _run_paddle(pdf_path: Path, md_path: Path, assets_path: Path) -> None:
+def _require_paddle_server(server_url: str) -> None:
+    """Fail fast unless the PaddleOCR-VL inference server is answering.
+
+    Without one PaddleOCR-VL recognises in-process, which measured at over
+    300 s for a single page here (GPU idle, one CPU core pinned) — slow enough
+    that a silent fallback looks like a hang.
+    """
+    import urllib.error
+    import urllib.request
+
+    health = server_url.rsplit("/v1", 1)[0].rstrip("/") + "/health"
+    try:
+        with urllib.request.urlopen(health, timeout=3) as resp:
+            if resp.status == 200:
+                return
+    except (urllib.error.URLError, OSError):
+        pass
+    sys.exit(
+        f"error: no PaddleOCR-VL inference server at {server_url}.\n"
+        "Start one first (it holds ~7 GB of VRAM while it runs):\n\n"
+        f"  VIRTUAL_ENV={PADDLE_VENV} {PADDLE_VENV}/bin/paddleocr genai_server \\\n"
+        "      --model_name PaddleOCR-VL-1.6-0.9B --backend vllm --port 8118 \\\n"
+        "      --backend_config vllm_12gb.yaml\n\n"
+        "Or run with --engine deepseek, which needs no server."
+    )
+
+
+def _run_paddle(
+    pdf_path: Path,
+    md_path: Path,
+    assets_path: Path,
+    vl_backend: str | None = None,
+    server_url: str | None = None,
+) -> None:
     """OCR the PDF with PaddleOCR-VL in its own venv, writing markdown + assets."""
+    if vl_backend == "vllm-server":
+        _require_paddle_server(server_url or PADDLE_SERVER_URL)
     cmd = [
         _paddle_python(), str(PADDLE_RUNNER),
         str(pdf_path), str(md_path), str(assets_path),
     ]
+    if vl_backend:
+        cmd += ["--vl-backend", vl_backend]
+    if server_url:
+        cmd += ["--server-url", server_url]
     result = subprocess.run(cmd)
     if result.returncode != 0:
         sys.exit(f"PaddleOCR-VL failed (exit {result.returncode})")
 
 
-def _absolutize_images(text: str, md_dir: Path) -> str:
-    """Rewrite ![](rel/path) image links to absolute paths.
+def _resolve_asset(rel: str, md_dir: Path) -> Path | None:
+    """Find the file an OCR engine's relative image reference points at.
 
-    pdf_craft's relative markdown_assets_path does not line up with where the
-    asset files actually land (a nested pdf_test/pdf_test/assets/ layer), so
-    pandoc silently fails to embed them. We resolve each link against the
-    locations pdf_craft might have used and rewrite to an absolute path that
-    exists, so pandoc can always find and embed the image.
+    Neither engine's relative paths line up with where the files land.
+    pdf_craft adds a nested pdf_test/pdf_test/assets/ layer; PaddleOCR-VL
+    writes imgs/<name> into the markdown while paddle_ocr.py saves the image
+    flat under the assets directory. Both resolve against the candidate list.
+    """
+    name = Path(rel).name
+    candidates = [
+        md_dir / rel,
+        md_dir / name,
+        md_dir / "assets" / name,
+        md_dir / md_dir.name / "assets" / name,  # nested-dir bug
+        md_dir / "_tmp" / "assets" / name,
+    ]
+    for c in candidates:
+        if c.is_file():
+            return c.resolve()
+    hits = list(md_dir.rglob(name))  # last resort: search the work dir
+    return hits[0].resolve() if hits else None
+
+
+def _absolutize_images(text: str, md_dir: Path) -> str:
+    """Rewrite image references to absolute paths, so pandoc can embed them.
+
+    Covers both syntaxes the engines emit: pdf_craft writes ![](rel/path),
+    PaddleOCR-VL writes an <img src="rel/path"> inside a centring <div>.
+    An unresolvable reference is left alone and reported, never dropped.
     """
 
-    def resolve(m: re.Match) -> str:
-        rel = m.group(1)
-        if rel.startswith(("http://", "https://", "/")):
-            return m.group(0)
-        name = Path(rel).name
-        candidates = [
-            md_dir / rel,
-            md_dir / Path(rel).name,
-            md_dir / "assets" / name,
-            md_dir / md_dir.name / "assets" / name,  # nested-dir bug
-            md_dir / "_tmp" / "assets" / name,
-        ]
-        for c in candidates:
-            if c.is_file():
-                return f"![]({c.resolve()})"
-        # fall back to a recursive search under the markdown dir
-        hits = list(md_dir.rglob(name))
-        if hits:
-            return f"![]({hits[0].resolve()})"
+    def warn(rel: str) -> None:
         print(f"  warning: image not found, leaving as-is: {rel}", file=sys.stderr)
-        return m.group(0)
 
-    return re.sub(r"!\[\]\(([^)]*)\)", resolve, text)
+    def resolve_md(m: re.Match) -> str:
+        rel = m.group(1)
+        if rel.startswith(("http://", "https://", "/", "data:")):
+            return m.group(0)
+        found = _resolve_asset(rel, md_dir)
+        if found is None:
+            warn(rel)
+            return m.group(0)
+        return f"![]({found})"
+
+    def resolve_html(m: re.Match) -> str:
+        rel = m.group(2)
+        if rel.startswith(("http://", "https://", "/", "data:")):
+            return m.group(0)
+        found = _resolve_asset(rel, md_dir)
+        if found is None:
+            warn(rel)
+            return m.group(0)
+        return f"{m.group(1)}{found}{m.group(3)}"
+
+    text = re.sub(r"!\[\]\(([^)]*)\)", resolve_md, text)
+    return re.sub(
+        r'(<img\b[^>]*?\bsrc=")([^"]*)(")', resolve_html, text, flags=re.I
+    )
 
 
 def _strip_annotations(epub_dir: Path) -> int:
@@ -329,6 +400,8 @@ def convert(
     epub_path: Path,
     ocr_size: str = DEFAULT_OCR_SIZE,
     engine: str = DEFAULT_ENGINE,
+    vl_backend: str | None = PADDLE_VL_BACKEND,
+    server_url: str | None = PADDLE_SERVER_URL,
     work_dir: Path | None = None,
     keep_work: bool = False,
     title: str | None = None,
@@ -353,7 +426,7 @@ def convert(
     t0 = time.time()
     if engine == "paddle":
         print(f"[1/6] OCR {pdf_path.name} -> markdown (PaddleOCR-VL) ...", flush=True)
-        _run_paddle(pdf_path, md_path, assets_path)
+        _run_paddle(pdf_path, md_path, assets_path, vl_backend, server_url)
     else:
         print(
             f"[1/6] OCR {pdf_path.name} -> markdown (DeepSeek-OCR, ocr_size={ocr_size}) ...",
@@ -431,14 +504,26 @@ def main(argv: list[str] | None = None) -> None:
     )
     p.add_argument(
         "--engine", default=DEFAULT_ENGINE, choices=["deepseek", "paddle"],
-        help="OCR engine (default: deepseek, via pdf_craft). paddle = "
-             "PaddleOCR-VL 1.6 in its own .venv-paddle venv; opt-in only, its "
-             "serverless inference needs minutes per page on a 12 GB card.",
+        help="OCR engine (default: paddle = PaddleOCR-VL 1.6 in its own "
+             ".venv-paddle venv, which needs a running genai_server). "
+             "deepseek runs DeepSeek-OCR through pdf_craft and needs no server, "
+             "at roughly 6x the time per page.",
     )
     p.add_argument(
         "--ocr-size", default=DEFAULT_OCR_SIZE,
         choices=["tiny", "small", "base", "large", "gundam"],
         help="DeepSeek-OCR resolution tier (default: base); ignored by --engine paddle",
+    )
+    p.add_argument(
+        "--vl-backend", default=PADDLE_VL_BACKEND,
+        help=f"--engine paddle only: VL recognition backend (default: "
+             f"{PADDLE_VL_BACKEND}). Pass an empty string to recognise "
+             "in-process instead, which is minutes per page.",
+    )
+    p.add_argument(
+        "--server-url", default=PADDLE_SERVER_URL,
+        help=f"--engine paddle only: endpoint of that server "
+             f"(default: {PADDLE_SERVER_URL})",
     )
     p.add_argument(
         "--keep-work", action="store_true",
@@ -462,6 +547,8 @@ def main(argv: list[str] | None = None) -> None:
         epub_path=epub_path,
         ocr_size=args.ocr_size,
         engine=args.engine,
+        vl_backend=args.vl_backend,
+        server_url=args.server_url,
         keep_work=args.keep_work,
         split_references=args.split_references,
     )
