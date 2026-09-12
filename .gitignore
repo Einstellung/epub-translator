@@ -14,7 +14,8 @@ input/*.epub
 input/*.pdf
 output/*.epub
 
-# Downloaded OCR models (~6 GB, re-downloaded on demand)
+# Leftover DeepSeek-OCR model cache (~6 GB); nothing writes here since the
+# engine was dropped on 2026-09-12, and it is safe to delete.
 models/
 
 # Generated artifacts and scratch test data

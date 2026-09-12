@@ -1,20 +1,18 @@
 """Run PaddleOCR-VL over a PDF and write one Markdown file plus its image assets.
 
-This file lives in the repo but runs in its OWN virtualenv (`.venv-paddle`):
-`paddlex` pins `pyyaml==6.0.2` while this project needs `pyyaml>=6.0.3`, so the
-two dependency trees cannot share a venv. `pdf_to_epub.py --engine paddle`
-therefore invokes this script as a subprocess with that interpreter.
+`pdf_to_epub.py` runs this as a subprocess (same interpreter, same venv) so that
+paddle's GPU allocator is released when OCR is done and a hard crash in the
+recogniser comes back as an exit code rather than taking the caller down.
 
-Output contract (the same shape `pdf_craft.transform_markdown` produces, so the
-rest of the pipeline is unchanged):
+Output contract:
 
   * one Markdown file at `markdown_path`, pages concatenated in order;
   * images written under `assets_path`, referenced from the Markdown by paths
     that `pdf_to_epub._absolutize_images` can resolve.
 
 Usage:
-    .venv-paddle/bin/python paddle_ocr.py book.pdf out.md out_assets/
-    .venv-paddle/bin/python paddle_ocr.py book.pdf out.md out_assets/ \
+    uv run python paddle_ocr.py book.pdf out.md out_assets/
+    uv run python paddle_ocr.py book.pdf out.md out_assets/ \
         --vl-backend vllm-server --server-url http://localhost:8118/v1
 """
 
