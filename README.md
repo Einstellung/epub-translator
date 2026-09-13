@@ -304,7 +304,10 @@ ignored. `--strip-references` is kept as an alias.
 
 Requirements: `pandoc` on PATH (`sudo apt install pandoc`) and an NVIDIA GPU.
 PaddleOCR-VL's models (~2 GB) download once into `~/.paddlex/official_models`
-and are reused.
+and are reused. `_run_paddle` launches the OCR client with every `*_PROXY`
+variable stripped from its environment, since the vLLM server it talks to is
+always on localhost and httpx otherwise raises at client construction on an
+unsupported scheme such as `socks://`.
 
 ### Installing the OCR engine
 

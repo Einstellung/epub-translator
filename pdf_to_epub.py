@@ -59,6 +59,30 @@ from lxml import etree
 
 HERE = Path(__file__).parent
 PADDLE_RUNNER = HERE / "paddle_ocr.py"
+
+# Vars httpx (inside PaddleOCR-VL's OpenAI-compatible client) reads to build its
+# proxy map. It raises at client construction on an unsupported scheme such as
+# socks://, and NO_PROXY does not save us: httpx builds the map from these
+# first and only consults NO_PROXY to exempt hosts from proxies it already
+# parsed. The vLLM server the client talks to is always on localhost, so the
+# fix is to never hand the client a proxy to parse in the first place.
+_PROXY_ENV_VARS = (
+    "ALL_PROXY", "all_proxy",
+    "HTTP_PROXY", "http_proxy",
+    "HTTPS_PROXY", "https_proxy",
+)
+
+
+def _no_proxy_env(base_env: dict) -> dict:
+    """`base_env` with every proxy variable removed and NO_PROXY set.
+
+    Pure function of the mapping passed in, so it can be tested without
+    touching the real process environment (the caller passes `os.environ`).
+    """
+    env = {k: v for k, v in base_env.items() if k not in _PROXY_ENV_VARS}
+    env["NO_PROXY"] = "localhost,127.0.0.1"
+    env["no_proxy"] = "localhost,127.0.0.1"
+    return env
 PADDLE_MODEL = "PaddleOCR-VL-1.6-0.9B"
 PADDLE_SERVER_PORT = 8118
 PADDLE_SERVER_URL = f"http://localhost:{PADDLE_SERVER_PORT}/v1"
@@ -277,7 +301,7 @@ def _run_paddle(
         str(pdf_path), str(md_path), str(assets_path),
         "--vl-backend", "vllm-server", "--server-url", server_url,
     ]
-    result = subprocess.run(cmd)
+    result = subprocess.run(cmd, env=_no_proxy_env(os.environ))
     if result.returncode != 0:
         sys.exit(f"PaddleOCR-VL failed (exit {result.returncode})")
 
