@@ -23,8 +23,8 @@ this is required, and required again after every `uv sync`):
 uv run python apply_patches.py
 ```
 
-The tests cover the pure text passes (the markdown repair in `pdf_to_epub.py`),
-and need no GPU:
+The tests cover the pure text passes (the markdown repair in `pdf_to_epub.py`,
+the bilingual layout pass `fix_layout.py`), and need no GPU:
 
 ```bash
 uv run pytest
@@ -212,6 +212,10 @@ cp translate_book.yaml configs/my-book.yaml      # one-time per book
 uv run python translate_book.py configs/my-book.yaml
 uv run python polish_cjk.py output/my-book.zh-bilingual.epub out.epub   # see below
 ```
+
+For a Chinese target in `append-block` mode the runner ends with the
+[bilingual layout pass](#bilingual-layout-pass-fix_layoutpy), so its output
+already has list items and footnotes in one piece.
 
 **For a Chinese target, `translate_book.py` is not the last step.** Publisher
 stylesheets set a Latin-only `font-family` (Verdana, Arial), so every Han
@@ -609,6 +613,44 @@ reference book through all three maskers without an LLM (844 `<pre>`/`<code>`
 elements + 4 `<table>`s) reproduces every source XHTML document byte-identically.
 
 
+
+## Bilingual layout pass (`fix_layout.py`)
+
+`append-block` writes each translation as a clone of the original block,
+attributes and all, inserted right after it. `fix_layout.py` repairs the four
+places where that is wrong; `translate_book.py` runs it as its last step, and it
+runs standalone on a book translated earlier:
+
+```bash
+uv run python fix_layout.py output/book.zh-bilingual.epub output/book.fixed.epub
+uv run python fix_layout.py output/book.zh-bilingual.epub --stats   # count only
+```
+
+* **Language.** Every translation block sits under `<html xml:lang="en">` and
+  so was declared English. It gets `lang="zh"`, plus `xml:lang="zh"` when the
+  document uses `xml:lang`.
+* **List items.** The translation of an `<li>` was a second `<li>`: an extra
+  bullet, and an `<ol>` numbered the translations too. It moves inside the
+  original item as `<li>English<div lang="zh">中文</div></li>` — the shape the
+  Reading-Partner app's own translator writes.
+* **Footnotes.** A note that is itself the leaf block (`<aside
+  epub:type="footnote">`) became two notes for one reference, and readers that
+  hide footnote asides never showed the translated one. Its translation moves
+  into the original note the same way. A translation inside a note also
+  repeated the note's backlink (`1`, `*`); that copy is dropped, so one note
+  has one backlink. Note references in the translated body text are kept.
+* **TOC numbers.** Books translated before the TOC patch have
+  `I. INTRODUCTION I. 引言` in nav/NCX; the repeated number is dropped
+  (`I. INTRODUCTION 引言`). Current runs leave the TOC untranslated.
+
+A block counts as a translation when it is the next sibling of an original
+with the same tag and attributes (the translator's `__translated` id suffix and
+`polish_cjk.py`'s class and lang aside), the original has no CJK characters,
+and the clone is CJK-dominant. Text the translator joined in append-text form
+(`<li>text 中文<ul>…</ul></li>`) has no clone and stays as it is. Like
+`polish_cjk.py`, the pass edits the raw text at points and re-serialises
+nothing, untouched entries are byte-identical, a second run changes nothing,
+and the two passes can run in either order.
 
 ## CJK typography pass (`polish_cjk.py`)
 

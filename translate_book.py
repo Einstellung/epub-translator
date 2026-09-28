@@ -7,6 +7,7 @@ Pipeline:
   3. (optional) make a spine-trimmed copy of the EPUB so excluded
      documents (front matter, endnotes, index, ...) are skipped
   3. translate with a live tqdm progress bar
+  4. repair the bilingual layout (lang, list items, notes) -> fix_layout.py
 
 Usage:
     uv run python translate_book.py                 # reads translate_book.yaml
@@ -24,6 +25,7 @@ from dotenv import load_dotenv
 from epub_translator import SubmitKind, language, translate
 from tqdm import tqdm
 
+import fix_layout as fix_layout_mod
 import front_matter as front_matter_mod
 import glossary as glossary_mod
 import mask_code as mask_code_mod
@@ -387,6 +389,20 @@ def main() -> None:
     if exclude_ids:
         restored_ids = restore_spine(output, source, exclude_ids)
         print(f"spine: restored excluded docs into output: {restored_ids or 'none'}")
+
+    # 6. LAYOUT: append-block puts each translation right after its original as
+    #    a clone with the same attributes. fix_layout.py tags the translations
+    #    lang="zh" and moves a list item's or a footnote's translation inside
+    #    the original, so a list gains no bullets or numbers and a note stays
+    #    one note. It detects translations by CJK script, hence zh only.
+    if cfg["submit"] == "append-block" and lang == "zh":
+        Path(cache_path).mkdir(parents=True, exist_ok=True)
+        fixed = Path(cache_path) / f"{source.stem}.layout.epub"
+        layout = fix_layout_mod.fix_epub(output, fixed)
+        shutil.move(fixed, output)
+        print(f"layout: lang set on {layout['lang set']} block(s), "
+              f"{layout['list items merged']} list item(s) and "
+              f"{layout['notes merged']} note(s) merged")
 
     print(f"\n✅ converted: {output}")
 

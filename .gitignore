@@ -31,3 +31,6 @@ logs/
 
 # Tooling
 .codegraph/
+
+# Scratch output of local runs
+tmp/
